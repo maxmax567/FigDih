@@ -1,22 +1,20 @@
 use eframe::egui;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tungstenite::Message as WsMessage;
 
-// === Tipos (idénticos al servidor) ===
+// === Tipos (idénticos al servidor v3) ===
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ServerInfo { id: i64, name: String, icon: String, my_role: i64 }
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ChannelInfo { id: i64, server_id: i64, name: String }
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ChatMessage { id: i64, user_id: i64, username: String, channel_id: i64, text: String, timestamp: i64 }
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct MemberInfo { user_id: i64, username: String, role: i64, online: bool, muted_until: i64 }
 
@@ -61,42 +59,80 @@ enum ServerMsg {
 
 enum ModAction { Role(i64), Timeout, Kick, Ban }
 
-fn role_badge(r: i64) -> &'static str {
-    match r { 3 => "👑", 2 => "🛡️", 1 => "🔨", _ => "" }
+// === Ajustes persistentes ===
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct Settings { url: String, dark: bool, zoom: f32, timestamps: bool, compact: bool }
+impl Default for Settings {
+    fn default() -> Self {
+        Self { url: "ws://localhost:3000/ws".into(), dark: true, zoom: 1.0, timestamps: true, compact: false }
+    }
+}
+impl Settings {
+    fn load() -> Self {
+        std::fs::read_to_string("figdih-settings.json").ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+    fn save(&self) {
+        if let Ok(s) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write("figdih-settings.json", s);
+        }
+    }
 }
 
+// === Helpers ===
 fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
 }
-
 fn time_ago(ts: i64) -> String {
-    let diff = (now() - ts).max(0);
-    if diff < 60 { "ahora".into() }
-    else if diff < 3600 { format!("hace {}m", diff / 60) }
-    else if diff < 86400 { format!("hace {}h", diff / 3600) }
-    else { format!("hace {}d", diff / 86400) }
+    let d = (now() - ts).max(0);
+    if d < 60 { "ahora".into() }
+    else if d < 3600 { format!("hace {}m", d / 60) }
+    else if d < 86400 { format!("hace {}h", d / 3600) }
+    else { format!("hace {}d", d / 86400) }
+}
+fn role_badge(r: i64) -> &'static str {
+    match r { 3 => "👑", 2 => "🛡️", 1 => "🔨", _ => "" }
+}
+fn role_color(r: i64) -> egui::Color32 {
+    match r {
+        3 => egui::Color32::from_rgb(250, 166, 26),
+        2 => egui::Color32::from_rgb(88, 101, 242),
+        1 => egui::Color32::from_rgb(87, 242, 135),
+        _ => egui::Color32::from_rgb(219, 222, 225),
+    }
+}
+fn avatar_color(id: i64) -> egui::Color32 {
+    const P: [(u8, u8, u8); 6] = [(88,101,242),(87,242,135),(250,166,26),(237,66,69),(155,89,182),(26,188,156)];
+    let c = P[(id.unsigned_abs() as usize) % P.len()];
+    egui::Color32::from_rgb(c.0, c.1, c.2)
+}
+fn dark_visuals() -> egui::Visuals {
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = egui::Color32::from_rgb(30, 31, 34);
+    v.window_fill = egui::Color32::from_rgb(43, 45, 49);
+    v.extreme_bg_color = egui::Color32::from_rgb(27, 28, 31);
+    v.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(43, 45, 49);
+    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(54, 57, 63);
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(79, 84, 92);
+    v.widgets.active.bg_fill = egui::Color32::from_rgb(88, 101, 242);
+    v.selection.bg_fill = egui::Color32::from_rgb(88, 101, 242);
+    v.window_rounding = egui::Rounding::same(10.0);
+    v
 }
 
 struct FigDihApp {
-    authed: bool,
-    my_id: i64,
-    username: String,
-    password: String,
-    auth_error: String,
-    servers: Vec<ServerInfo>,
-    channels: Vec<ChannelInfo>,
-    messages: Vec<ChatMessage>,
-    members: Vec<MemberInfo>,
-    selected_server: Option<i64>,
-    selected_channel: Option<i64>,
-    my_role: i64,
+    authed: bool, my_id: i64,
+    username: String, password: String, auth_error: String,
+    servers: Vec<ServerInfo>, channels: Vec<ChannelInfo>,
+    messages: Vec<ChatMessage>, members: Vec<MemberInfo>,
+    selected_server: Option<i64>, selected_channel: Option<i64>, my_role: i64,
     input_text: String,
-    new_server_name: String,
-    new_server_icon: String,
-    new_channel_name: String,
-    unban_name: String,
-    show_create_server: bool,
-    status: String,
+    new_server_name: String, new_server_icon: String,
+    new_channel_name: String, unban_name: String,
+    show_create_server: bool, show_settings: bool, status: String,
+    settings: Settings,
+    stop: Arc<AtomicBool>,
     ws_tx: Option<mpsc::UnboundedSender<String>>,
     ws_rx: Option<mpsc::UnboundedReceiver<String>>,
     _rt: Arc<Runtime>,
@@ -104,58 +140,86 @@ struct FigDihApp {
 
 impl FigDihApp {
     fn new() -> Self {
-        let (gui_tx, mut gui_rx) = mpsc::unbounded_channel::<String>();
-        let (ws_tx, ws_rx) = mpsc::unbounded_channel::<String>();
-        let rt = Arc::new(Runtime::new().unwrap());
-        let rt2 = rt.clone();
-        rt2.spawn(async move {
-            if let Ok((stream, _)) = connect_async("ws://localhost:3000/ws").await {
-                let (mut write, mut read) = stream.split();
-                tokio::spawn(async move {
-                    while let Some(m) = gui_rx.recv().await {
-                        if write.send(WsMessage::Text(m)).await.is_err() { break; }
-                    }
-                });
-                while let Some(Ok(m)) = read.next().await {
-                    if let WsMessage::Text(t) = m { let _ = ws_tx.send(t); }
-                }
-            } else {
-                eprintln!("⚠️ No se pudo conectar al servidor");
-            }
-        });
-        Self {
+        let settings = Settings::load();
+        let mut app = Self {
             authed: false, my_id: 0, username: String::new(), password: String::new(),
             auth_error: String::new(), servers: vec![], channels: vec![], messages: vec![],
             members: vec![], selected_server: None, selected_channel: None, my_role: 0,
             input_text: String::new(), new_server_name: String::new(), new_server_icon: String::new(),
-            new_channel_name: String::new(), unban_name: String::new(), show_create_server: false,
-            status: String::new(), ws_tx: Some(gui_tx), ws_rx: Some(ws_rx), _rt: rt,
-        }
+            new_channel_name: String::new(), unban_name: String::new(),
+            show_create_server: false, show_settings: false, status: String::new(),
+            settings, stop: Arc::new(AtomicBool::new(false)),
+            ws_tx: None, ws_rx: None, _rt: Arc::new(Runtime::new().unwrap()),
+        };
+        let url = app.settings.url.clone();
+        app.connect(url);
+        app
+    }
+
+    fn connect(&mut self, url: String) {
+        self.stop.store(true, Ordering::Relaxed);
+        let stop = Arc::new(AtomicBool::new(false));
+        self.stop = stop.clone();
+        let (gui_tx, mut gui_rx) = mpsc::unbounded_channel::<String>();
+        let (ws_tx, ws_rx) = mpsc::unbounded_channel::<String>();
+        let rt = self._rt.clone();
+        self.status = format!("🔌 Conectando a {} ...", url);
+        rt.spawn(async move {
+            match connect_async(url.as_str()).await {
+                Ok((stream, _)) => {
+                    let (mut write, mut read) = stream.split();
+                    tokio::spawn(async move {
+                        while let Some(m) = gui_rx.recv().await {
+                            if write.send(WsMessage::Text(m)).await.is_err() { break; }
+                        }
+                    });
+                    loop {
+                        tokio::select! {
+                            m = read.next() => {
+                                match m {
+                                    Some(Ok(WsMessage::Text(t))) => { if ws_tx.send(t).is_err() { break; } }
+                                    Some(Ok(_)) => {}
+                                    _ => break,
+                                }
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                                if stop.load(Ordering::Relaxed) { break; }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    let _ = ws_tx.send(serde_json::to_string(&ServerMsg::AuthErr {
+                        reason: format!("No se pudo conectar a {}", url),
+                    }).unwrap());
+                }
+            }
+        });
+        self.ws_tx = Some(gui_tx);
+        self.ws_rx = Some(ws_rx);
+        self.authed = false; self.my_id = 0;
+        self.servers.clear(); self.channels.clear(); self.messages.clear(); self.members.clear();
+        self.selected_server = None; self.selected_channel = None; self.my_role = 0;
     }
 
     fn send_command(&self, cmd: ClientMsg) {
         if let Some(tx) = &self.ws_tx {
-            if let Ok(json) = serde_json::to_string(&cmd) { let _ = tx.send(json); }
+            if let Ok(j) = serde_json::to_string(&cmd) { let _ = tx.send(j); }
         }
     }
-
     fn refresh_my_role(&mut self) {
         self.my_role = self.servers.iter()
             .find(|s| Some(s.id) == self.selected_server)
             .map(|s| s.my_role).unwrap_or(0);
     }
-
     fn select_server(&mut self, id: i64) {
         self.selected_server = Some(id);
         self.selected_channel = None;
-        self.channels.clear();
-        self.messages.clear();
-        self.members.clear();
+        self.channels.clear(); self.messages.clear(); self.members.clear();
         self.refresh_my_role();
         self.send_command(ClientMsg::GetChannels { server_id: id });
         self.send_command(ClientMsg::GetMembers { server_id: id });
     }
-
     fn select_channel(&mut self, id: i64) {
         if self.selected_channel == Some(id) { return; }
         self.send_command(ClientMsg::Leave);
@@ -164,25 +228,64 @@ impl FigDihApp {
         self.send_command(ClientMsg::Join { channel_id: id });
         self.send_command(ClientMsg::GetMessages { channel_id: id, limit: 50 });
     }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings { return; }
+        let mut do_connect: Option<String> = None;
+        let mut do_logout = false;
+        let mut close = false;
+        egui::Window::new("⚙️ Configuración")
+            .collapsible(false).resizable(false).default_width(380.0)
+            .show(ctx, |ui| {
+                ui.heading("🔌 Conexión");
+                ui.label("URL del servidor WebSocket:");
+                ui.add(egui::TextEdit::singleline(&mut self.settings.url).desired_width(340.0));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Reconectar").clicked() { do_connect = Some(self.settings.url.clone()); }
+                    if ui.button("Usar localhost").clicked() {
+                        self.settings.url = "ws://localhost:3000/ws".into();
+                        self.settings.save();
+                    }
+                });
+                ui.add_space(8.0); ui.separator();
+                ui.heading("🎨 Apariencia");
+                let mut dark = self.settings.dark;
+                if ui.checkbox(&mut dark, "Tema oscuro").changed() { self.settings.dark = dark; self.settings.save(); }
+                let mut ts = self.settings.timestamps;
+                if ui.checkbox(&mut ts, "Mostrar horas en mensajes").changed() { self.settings.timestamps = ts; self.settings.save(); }
+                let mut cp = self.settings.compact;
+                if ui.checkbox(&mut cp, "Modo compacto").changed() { self.settings.compact = cp; self.settings.save(); }
+                let mut z = self.settings.zoom;
+                if ui.add(egui::Slider::new(&mut z, 0.8..=1.6).text("Zoom")).changed() { self.settings.zoom = z; self.settings.save(); }
+                ui.add_space(8.0); ui.separator();
+                ui.horizontal(|ui| {
+                    if self.authed && ui.button("🚪 Cerrar sesión").clicked() { do_logout = true; }
+                    if ui.button("Cerrar").clicked() { close = true; }
+                });
+            });
+        if let Some(u) = do_connect { self.settings.save(); self.connect(u); self.show_settings = false; }
+        if do_logout { self.password.clear(); let u = self.settings.url.clone(); self.connect(u); self.show_settings = false; }
+        if close { self.show_settings = false; }
+    }
 }
 
 impl eframe::App for FigDihApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // === Procesar mensajes del servidor ===
-        // 1) Drenamos a un Vec: el préstamo de ws_rx termina aquí
+        ctx.set_visuals(if self.settings.dark { dark_visuals() } else { egui::Visuals::light() });
+        ctx.set_zoom_factor(self.settings.zoom);
+
+        // === Drenar y procesar mensajes ===
         let mut incoming: Vec<String> = Vec::new();
         if let Some(rx) = &mut self.ws_rx {
-            while let Ok(text) = rx.try_recv() {
-                incoming.push(text);
-            }
+            while let Ok(t) = rx.try_recv() { incoming.push(t); }
         }
-        // 2) Procesamos con self completamente libre
         for text in incoming {
             if let Ok(m) = serde_json::from_str::<ServerMsg>(&text) {
                 match m {
                     ServerMsg::AuthOk { user_id, username } => {
                         self.authed = true; self.my_id = user_id; self.username = username;
-                        self.auth_error.clear();
+                        self.auth_error.clear(); self.status = "🟢 Conectado".into();
                         self.send_command(ClientMsg::GetServers);
                     }
                     ServerMsg::AuthErr { reason } => self.auth_error = reason,
@@ -199,9 +302,7 @@ impl eframe::App for FigDihApp {
                         if self.selected_channel == Some(m.channel_id) { self.messages.push(m); }
                     }
                     ServerMsg::MessageDeleted { channel_id, message_id } => {
-                        if self.selected_channel == Some(channel_id) {
-                            self.messages.retain(|m| m.id != message_id);
-                        }
+                        if self.selected_channel == Some(channel_id) { self.messages.retain(|m| m.id != message_id); }
                     }
                     ServerMsg::Members { server_id, members } => {
                         if self.selected_server == Some(server_id) { self.members = members; }
@@ -226,34 +327,47 @@ impl eframe::App for FigDihApp {
             }
         }
 
-        // === Pantalla de login/registro ===
+        // === Login / Registro ===
         if !self.authed {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(80.0);
+                    ui.add_space(60.0);
                     ui.heading("💬 FigDih");
-                    ui.label("Chat ultraligero en Rust");
-                    ui.add_space(30.0);
-                    ui.add(egui::TextEdit::singleline(&mut self.username).hint_text("Usuario").desired_width(220.0));
+                    ui.label(egui::RichText::new("Chat ultraligero en Rust · v3.1").color(egui::Color32::GRAY));
+                    ui.add_space(24.0);
+                    egui::Frame::none()
+                        .fill(ctx.style().visuals.window_fill)
+                        .rounding(egui::Rounding::same(12.0))
+                        .inner_margin(egui::Margin::same(24.0))
+                        .show(ui, |ui| {
+                            ui.set_width(260.0);
+                            ui.label("Usuario");
+                            ui.add(egui::TextEdit::singleline(&mut self.username).desired_width(260.0));
+                            ui.add_space(8.0);
+                            ui.label("Contraseña");
+                            let pw = ui.add(egui::TextEdit::singleline(&mut self.password).password(true).desired_width(260.0));
+                            ui.add_space(16.0);
+                            let enter = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            ui.horizontal(|ui| {
+                                if ui.add_sized([125.0, 32.0], egui::Button::new("Entrar 🔑")).clicked() || enter {
+                                    self.send_command(ClientMsg::Login { username: self.username.clone(), password: self.password.clone() });
+                                }
+                                if ui.add_sized([125.0, 32.0], egui::Button::new("Registrarse ✨")).clicked() {
+                                    self.send_command(ClientMsg::Register { username: self.username.clone(), password: self.password.clone() });
+                                }
+                            });
+                            if !self.auth_error.is_empty() {
+                                ui.add_space(10.0);
+                                ui.colored_label(egui::Color32::from_rgb(237, 66, 69), &self.auth_error);
+                            }
+                        });
+                    ui.add_space(16.0);
+                    if ui.button("⚙️ Configuración de conexión").clicked() { self.show_settings = true; }
                     ui.add_space(8.0);
-                    let pw = ui.add(egui::TextEdit::singleline(&mut self.password).password(true).hint_text("Contraseña").desired_width(220.0));
-                    ui.add_space(15.0);
-                    let enter = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    ui.horizontal(|ui| {
-                        ui.add_space(ui.available_width() / 2.0 - 110.0);
-                        if ui.button("Entrar 🔑").clicked() || enter {
-                            self.send_command(ClientMsg::Login { username: self.username.clone(), password: self.password.clone() });
-                        }
-                        if ui.button("Registrarse ✨").clicked() {
-                            self.send_command(ClientMsg::Register { username: self.username.clone(), password: self.password.clone() });
-                        }
-                    });
-                    if !self.auth_error.is_empty() {
-                        ui.add_space(10.0);
-                        ui.colored_label(egui::Color32::from_rgb(237, 66, 69), &self.auth_error);
-                    }
+                    ui.label(egui::RichText::new(&self.status).small().color(egui::Color32::GRAY));
                 });
             });
+            self.settings_window(ctx);
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
             return;
         }
@@ -262,33 +376,40 @@ impl eframe::App for FigDihApp {
         let mut server_clicked: Option<i64> = None;
         let mut create_clicked = false;
         let mut refresh_clicked = false;
+        let mut settings_clicked = false;
         egui::SidePanel::left("servers").default_width(72.0).show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(10.0);
-                if ui.add(egui::Button::new("＋").min_size(egui::vec2(48.0, 48.0)).rounding(egui::Rounding::same(16.0))).on_hover_text("Crear servidor").clicked() {
-                    create_clicked = true;
-                }
-                if ui.add(egui::Button::new("🔄").min_size(egui::vec2(48.0, 30.0))).on_hover_text("Refrescar").clicked() {
-                    refresh_clicked = true;
-                }
+                if ui.add(egui::Button::new("+").min_size(egui::vec2(48.0, 48.0)).rounding(egui::Rounding::same(16.0)))
+                    .on_hover_text("Crear servidor").clicked() { create_clicked = true; }
+                ui.add_space(6.0);
+                if ui.add(egui::Button::new("🔄").min_size(egui::vec2(48.0, 30.0)))
+                    .on_hover_text("Refrescar").clicked() { refresh_clicked = true; }
+                if ui.add(egui::Button::new("⚙️").min_size(egui::vec2(48.0, 30.0)))
+                    .on_hover_text("Configuración").clicked() { settings_clicked = true; }
                 ui.separator();
                 ui.add_space(8.0);
-                for s in &self.servers {
-                    let sel = self.selected_server == Some(s.id);
-                    let mut btn = egui::Button::new(&s.icon).min_size(egui::vec2(48.0, 48.0)).rounding(egui::Rounding::same(if sel { 12.0 } else { 24.0 }));
-                    if sel { btn = btn.fill(egui::Color32::from_rgb(88, 101, 242)); }
-                    if ui.add(btn).on_hover_text(format!("{} {}", s.name, role_badge(s.my_role))).clicked() {
-                        server_clicked = Some(s.id);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for s in &self.servers {
+                        let sel = self.selected_server == Some(s.id);
+                        let mut btn = egui::Button::new(&s.icon)
+                            .min_size(egui::vec2(48.0, 48.0))
+                            .rounding(egui::Rounding::same(if sel { 12.0 } else { 24.0 }));
+                        if sel { btn = btn.fill(egui::Color32::from_rgb(88, 101, 242)); }
+                        if ui.add(btn).on_hover_text(format!("{} {}", s.name, role_badge(s.my_role))).clicked() {
+                            server_clicked = Some(s.id);
+                        }
+                        ui.add_space(8.0);
                     }
-                    ui.add_space(8.0);
-                }
+                });
             });
         });
         if create_clicked { self.show_create_server = true; }
         if refresh_clicked { self.send_command(ClientMsg::GetServers); }
+        if settings_clicked { self.show_settings = true; }
         if let Some(id) = server_clicked { self.select_server(id); }
 
-        // === Panel de canales ===
+        // === Canales ===
         let mut channel_clicked: Option<i64> = None;
         egui::SidePanel::left("channels").default_width(230.0).show(ctx, |ui| {
             if let Some(sid) = self.selected_server {
@@ -306,8 +427,7 @@ impl eframe::App for FigDihApp {
                     if ui.add(btn).clicked() { channel_clicked = Some(c.id); }
                 }
                 if self.my_role >= 2 {
-                    ui.add_space(10.0);
-                    ui.separator();
+                    ui.add_space(10.0); ui.separator();
                     ui.label(egui::RichText::new("🛡️ Crear canal").small());
                     ui.add(egui::TextEdit::singleline(&mut self.new_channel_name).hint_text("nombre").desired_width(150.0));
                     if ui.button("Crear").clicked() && !self.new_channel_name.trim().is_empty() {
@@ -322,7 +442,7 @@ impl eframe::App for FigDihApp {
         });
         if let Some(id) = channel_clicked { self.select_channel(id); }
 
-        // === Panel de miembros ===
+        // === Miembros ===
         let mut mod_action: Option<(String, ModAction)> = None;
         egui::SidePanel::right("members").default_width(200.0).show(ctx, |ui| {
             if self.selected_server.is_some() {
@@ -333,8 +453,8 @@ impl eframe::App for FigDihApp {
                 for m in &self.members {
                     let dot = if m.online { "🟢" } else { "⚫" };
                     let mute = if m.muted_until > t { " 🔇" } else { "" };
-                    let label = format!("{} {} {}{}", dot, role_badge(m.role), m.username, mute);
-                    let resp = ui.add(egui::Label::new(label).sense(egui::Sense::click()));
+                    let txt = format!("{} {} {}{}", dot, role_badge(m.role), m.username, mute);
+                    let resp = ui.add(egui::Label::new(egui::RichText::new(txt).color(role_color(m.role))).sense(egui::Sense::click()));
                     let can_mod = m.user_id != self.my_id && m.role < self.my_role;
                     if can_mod {
                         resp.context_menu(|ui| {
@@ -354,8 +474,7 @@ impl eframe::App for FigDihApp {
                     }
                 }
                 if self.my_role >= 2 {
-                    ui.add_space(10.0);
-                    ui.separator();
+                    ui.add_space(10.0); ui.separator();
                     ui.label(egui::RichText::new("🚫 Desbanear").small());
                     ui.add(egui::TextEdit::singleline(&mut self.unban_name).hint_text("usuario").desired_width(120.0));
                     if ui.button("Desbanear").clicked() && !self.unban_name.trim().is_empty() {
@@ -386,7 +505,7 @@ impl eframe::App for FigDihApp {
                     let n = self.channels.iter().find(|c| c.id == cid).map(|c| c.name.clone()).unwrap_or_default();
                     ui.label(egui::RichText::new(format!("# {}", n)).strong());
                 } else {
-                    ui.label("FigDih v3.0");
+                    ui.label("FigDih v3.1");
                 }
                 ui.separator();
                 ui.label(egui::RichText::new(&self.status).small().color(egui::Color32::from_rgb(250, 166, 26)));
@@ -404,7 +523,7 @@ impl eframe::App for FigDihApp {
                     let te = ui.add(egui::TextEdit::singleline(&mut self.input_text)
                         .hint_text("Escribe un mensaje...").desired_width(ui.available_width() - 90.0));
                     let enter = te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.add(egui::Button::new("Enviar 🚀").min_size(egui::vec2(80.0, 28.0))).clicked() || enter {
+                    if ui.add_sized([80.0, 28.0], egui::Button::new("Enviar 🚀")).clicked() || enter {
                         if !self.input_text.trim().is_empty() {
                             self.send_command(ClientMsg::Send { text: self.input_text.clone() });
                             self.input_text.clear();
@@ -417,19 +536,34 @@ impl eframe::App for FigDihApp {
             ui.add_space(4.0);
         });
 
-        // === Mensajes ===
+        // === Mensajes con avatares ===
         let mut delete_clicked: Option<i64> = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.selected_channel.is_some() {
                 egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false; 2]).show(ui, |ui| {
                     ui.add_space(8.0);
+                    let gap = if self.settings.compact { 2.0 } else { 10.0 };
                     for m in &self.messages {
                         if m.user_id == 0 {
                             ui.label(egui::RichText::new(&m.text).italics().small().color(egui::Color32::GRAY));
-                        } else {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(&m.username).strong().color(egui::Color32::from_rgb(88, 101, 242)));
-                                ui.label(egui::RichText::new(time_ago(m.timestamp)).small().color(egui::Color32::GRAY));
+                            ui.add_space(gap);
+                            continue;
+                        }
+                        let role = self.members.iter().find(|mm| mm.user_id == m.user_id).map(|mm| mm.role).unwrap_or(0);
+                        ui.horizontal_top(|ui| {
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
+                            ui.painter().circle_filled(rect.center(), 17.0, avatar_color(m.user_id));
+                            let ini: String = m.username.chars().next().unwrap_or('?').to_uppercase().collect();
+                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, ini,
+                                egui::FontId::proportional(16.0), egui::Color32::WHITE);
+                            ui.add_space(6.0);
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(&m.username).strong().color(role_color(role)));
+                                    if self.settings.timestamps {
+                                        ui.label(egui::RichText::new(time_ago(m.timestamp)).small().color(egui::Color32::GRAY));
+                                    }
+                                });
                                 let resp = ui.add(egui::Label::new(&m.text).sense(egui::Sense::click()));
                                 if m.user_id == self.my_id || self.my_role >= 1 {
                                     resp.context_menu(|ui| {
@@ -440,19 +574,23 @@ impl eframe::App for FigDihApp {
                                     });
                                 }
                             });
-                        }
-                        ui.add_space(4.0);
+                        });
+                        ui.add_space(gap);
                     }
                 });
             } else {
                 ui.centered_and_justified(|ui| {
-                    ui.heading("👋 Elige un servidor y un canal");
+                    ui.vertical_centered(|ui| {
+                        ui.heading("👋 Bienvenido a FigDih");
+                        ui.add_space(8.0);
+                        ui.label("Elige un servidor y un canal para empezar");
+                    });
                 });
             }
         });
         if let Some(id) = delete_clicked { self.send_command(ClientMsg::DeleteMessage { message_id: id }); }
 
-        // === Ventana crear servidor ===
+        // === Crear servidor ===
         if self.show_create_server {
             egui::Window::new("Crear servidor").collapsible(false).resizable(false).show(ctx, |ui| {
                 ui.label("Nombre:");
@@ -463,8 +601,7 @@ impl eframe::App for FigDihApp {
                 ui.horizontal(|ui| {
                     if ui.button("Crear 🎉").clicked() && !self.new_server_name.trim().is_empty() {
                         self.send_command(ClientMsg::CreateServer { name: self.new_server_name.clone(), icon: self.new_server_icon.clone() });
-                        self.new_server_name.clear();
-                        self.new_server_icon.clear();
+                        self.new_server_name.clear(); self.new_server_icon.clear();
                         self.show_create_server = false;
                     }
                     if ui.button("Cerrar").clicked() { self.show_create_server = false; }
@@ -472,6 +609,7 @@ impl eframe::App for FigDihApp {
             });
         }
 
+        self.settings_window(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 }
@@ -481,8 +619,18 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 750.0])
             .with_min_inner_size([900.0, 550.0])
-            .with_title("FigDih v3.0"),
+            .with_title("FigDih v3.1"),
         ..Default::default()
     };
-    eframe::run_native("FigDih", options, Box::new(|_cc| Box::new(FigDihApp::new())))
+    eframe::run_native("FigDih", options, Box::new(|cc| {
+        // Fuente de emojis como fallback (adiós a los cuadraditos □)
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert("emoji".to_owned(),
+            egui::FontData::from_static(include_bytes!("../assets/NotoEmoji.ttf")));
+        if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            f.push("emoji".to_owned());
+        }
+        cc.egui_ctx.set_fonts(fonts);
+        Box::new(FigDihApp::new())
+    }))
 }
