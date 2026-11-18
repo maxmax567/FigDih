@@ -6,41 +6,54 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ============ WINDOWS ============
+  # ==================== WINDOWS ====================
   build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencias
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             server
             client
-      - name: Build server
+
+      - name: Build servidor
         working-directory: server
         run: cargo build --release
-      - name: Build client
+
+      - name: Build cliente
         working-directory: client
         run: cargo build --release
-      - name: Package
+
+      - name: Empaquetar
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item server/target/release/figdih-server.exe dist/
           Copy-Item client/target/release/figdih-client.exe dist/
-      - uses: actions/upload-artifact@v4
+
+      - name: Subir artifact
+        uses: actions/upload-artifact@v4
         with:
           name: FigDih-Windows
           path: dist/
 
-  # ============ LINUX + APPIMAGE ============
+  # ==================== LINUX + APPIMAGE ====================
   build-linux:
     runs-on: ubuntu-22.04   # glibc 2.35 → compatible con distros 2022+
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencias
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             server
@@ -53,10 +66,11 @@ jobs:
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libx11-dev libx11-xcb-dev libgl1-mesa-dev libegl1-mesa-dev libgles2-mesa-dev
 
-      - name: Build server
+      - name: Build servidor
         working-directory: server
         run: cargo build --release
-      - name: Build client
+
+      - name: Build cliente
         working-directory: client
         run: cargo build --release
 
@@ -86,15 +100,19 @@ jobs:
           Icon=figdih
           Categories=Network;InstantMessaging;
           EOF
-          convert -size 256x256 gradient:'#5865F2'-'#3b44b8' -fill white \
-            -gravity center -pointsize 150 -annotate +0+0 'F' AppDir/figdih.png
+          convert -size 256x256 gradient:'#5865F2'-'#3b44b8' \
+            -fill white -stroke none \
+            -draw "roundrectangle 48,56 208,168 28,28" \
+            -draw "polygon 88,160 88,204 132,168" \
+            AppDir/figdih.png
           cp AppDir/figdih.png AppDir/.DirIcon
           wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool-x86_64.AppImage
           ./appimagetool-x86_64.AppImage --appimage-extract >/dev/null
           ./squashfs-root/AppRun AppDir FigDih-x86_64.AppImage
 
-      - uses: actions/upload-artifact@v4
+      - name: Subir artifact
+        uses: actions/upload-artifact@v4
         with:
           name: FigDih-Linux
           path: |
