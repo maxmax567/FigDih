@@ -1,0 +1,76 @@
+name: AppImage Todo-en-Uno (manual)
+
+on:
+  workflow_dispatch:   # ← SOLO manual, nunca con push
+
+jobs:
+  build-allinone:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencias
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            server
+            client
+
+      - name: Dependencias de GUI (egui/winit)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libx11-dev libx11-xcb-dev libgl1-mesa-dev libegl1-mesa-dev libgles2-mesa-dev
+
+      - name: Build servidor
+        working-directory: server
+        run: cargo build --release
+
+      - name: Build cliente
+        working-directory: client
+        run: cargo build --release
+
+      - name: Construir AppImage todo-en-uno
+        run: |
+          mkdir -p AppDir/usr/bin
+          cp client/target/release/figdih-client AppDir/usr/bin/
+          cp server/target/release/figdih-server AppDir/usr/bin/
+          cat > AppDir/AppRun << 'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          case "$1" in
+            --server) exec "$HERE/usr/bin/figdih-server" ;;
+            --both)   "$HERE/usr/bin/figdih-server" & exec "$HERE/usr/bin/figdih-client" ;;
+            *)        exec "$HERE/usr/bin/figdih-client" "$@" ;;
+          esac
+          EOF
+          chmod +x AppDir/AppRun
+          cat > AppDir/figdih.desktop << 'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=FigDih
+          Comment=Chat ultraligero en Rust
+          Exec=figdih-client
+          Icon=figdih
+          Categories=Network;InstantMessaging;
+          EOF
+          convert -size 256x256 gradient:'#5865F2'-'#3b44b8' \
+            -fill white -stroke none \
+            -draw "roundrectangle 48,56 208,168 28,28" \
+            -draw "polygon 88,160 88,204 132,168" \
+            AppDir/figdih.png
+          cp AppDir/figdih.png AppDir/.DirIcon
+          wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          ./appimagetool-x86_64.AppImage --appimage-extract >/dev/null
+          ./squashfs-root/AppRun AppDir FigDih-x86_64.AppImage
+
+      - name: Subir artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FigDih-AllInOne-AppImage
+          path: FigDih-x86_64.AppImage
