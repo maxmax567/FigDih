@@ -1,10 +1,9 @@
 # ---- Compilación ----
-FROM rust:1.82-slim AS builder
+FROM rust:slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 
-# Copiamos la carpeta entera: sin globs, sin trucos de main.rs vacío
 COPY server/ ./server/
 RUN cd server && cargo build --release
 
