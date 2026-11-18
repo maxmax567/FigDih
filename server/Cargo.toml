@@ -1,0 +1,21 @@
+[package]
+name = "figdih-server"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dashmap = "5"
+futures-util = "0.3"
+tokio-rusqlite = "0.5" # <-- Reemplaza rusqlite por esta versión asíncrona
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

@@ -1,0 +1,43 @@
+name: Build Windows Release
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencias
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            server
+            client
+
+      - name: Build servidor
+        working-directory: server
+        run: cargo build --release
+
+      - name: Build cliente
+        working-directory: client
+        run: cargo build --release
+
+      - name: Empaquetar
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item server/target/release/figdih-server.exe dist/
+          Copy-Item client/target/release/figdih-client.exe dist/
+
+      - name: Subir artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FigDih-Windows
+          path: dist/
