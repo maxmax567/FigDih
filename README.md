@@ -15,29 +15,3 @@ Cliente de escritorio ligero y servidor con persistencia SQLite.
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 </div>
-
----
-
-## ✨ Características
-
-- 🖥️ **Cliente multiplataforma** construido con `egui` (Windows, Linux, macOS)
-- 🌐 **Servidor en Rust** con persistencia en **SQLite**
-- 🎨 **Temas** intercambiables, incluyendo un **tema estilo Discord**
-- 😀 **Emojis** integrados en el chat
-- 🔔 **Notificaciones** de escritorio
-- ⚙️ **Menú de configuración** completo
-- 🔌 **Reconexión automática** ante caídas de red
-- 🐳 **Despliegue con Docker**
-- 🚀 **Releases automatizadas** con GitHub Actions
-
-## 📁 Estructura del proyecto
-
-```text
-FigDih/
-├── client/              # Cliente de escritorio (egui)
-│   ├── assets/          # Iconos e imágenes (icon.svg / icon.png)
-│   └── src/
-├── server/              # Servidor Rust + SQLite
-│   └── src/
-├── docker/              # Dockerfile del servidor
-└── .github/workflows/   # CI y releases
