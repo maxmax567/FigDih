@@ -134,7 +134,7 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            url: "ws://localhost:3000/ws".into(),
+            url: "wss://biz-scenes-assumed-history.trycloudflare.com/ws".into(),
             theme: Theme::Blurple,
             zoom: 1.0,
             timestamps: true,
