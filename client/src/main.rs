@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tungstenite::Message as WsMessage;
 
-// === Tipos (idénticos al servidor v3) ===
+// === Tipos del servidor ===
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ServerInfo { id: i64, name: String, icon: String, my_role: i64 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -59,12 +59,94 @@ enum ServerMsg {
 
 enum ModAction { Role(i64), Timeout, Kick, Ban }
 
+// === Temas ===
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+enum Theme {
+    Dark, Light, Blurple, Midnight, Forest, Sunset, Cyberpunk, Mono,
+}
+impl Default for Theme { fn default() -> Self { Theme::Blurple } }
+impl Theme {
+    fn all() -> [(Self, &'static str); 8] {
+        use Theme::*;
+        [(Dark, "🌑 Dark"), (Light, "☀️ Light"), (Blurple, "💎 Blurple"),
+         (Midnight, "🌌 Midnight"), (Forest, "🌲 Forest"), (Sunset, "🌅 Sunset"),
+         (Cyberpunk, "🤖 Cyberpunk"), (Mono, "🖤 Mono")]
+    }
+    fn visuals(self) -> egui::Visuals {
+        let mut v = match self {
+            Theme::Light => egui::Visuals::light(),
+            _ => egui::Visuals::dark(),
+        };
+        let (panel, window, extreme, widget, hover, active, selection) = match self {
+            Theme::Dark     => ((30,31,34),  (43,45,49),  (27,28,31),  (54,57,63),  (79,84,92),  (88,101,242), (88,101,242)),
+            Theme::Light    => ((255,255,255), (245,245,245), (230,230,230), (200,200,200), (180,180,180), (88,101,242), (88,101,242)),
+            Theme::Blurple  => ((30,31,34),  (43,45,49),  (27,28,31),  (54,57,63),  (79,84,92),  (88,101,242), (88,101,242)),
+            Theme::Midnight => ((15,23,42),  (30,41,59),  (2,6,23),    (51,65,85),  (71,85,105), (99,102,241), (99,102,241)),
+            Theme::Forest   => ((20,35,25),  (28,48,35),  (12,24,17),  (45,80,55),  (65,110,80), (76,175,80), (76,175,80)),
+            Theme::Sunset   => ((45,25,35),  (65,35,50),  (30,15,25),  (100,55,70), (130,70,85), (255,107,74), (255,107,74)),
+            Theme::Cyberpunk=> ((15,10,30),  (25,18,45),  (8,5,20),    (45,30,75),  (70,45,110), (255,0,170), (0,255,255)),
+            Theme::Mono     => ((10,10,10),  (20,20,20),  (0,0,0),     (40,40,40),  (60,60,60),  (200,200,200), (200,200,200)),
+        };
+        v.panel_fill = egui::Color32::from_rgb(panel.0, panel.1, panel.2);
+        v.window_fill = egui::Color32::from_rgb(window.0, window.1, window.2);
+        v.extreme_bg_color = egui::Color32::from_rgb(extreme.0, extreme.1, extreme.2);
+        v.widgets.inactive.bg_fill = egui::Color32::from_rgb(widget.0, widget.1, widget.2);
+        v.widgets.hovered.bg_fill = egui::Color32::from_rgb(hover.0, hover.1, hover.2);
+        v.widgets.active.bg_fill = egui::Color32::from_rgb(active.0, active.1, active.2);
+        v.selection.bg_fill = egui::Color32::from_rgb(selection.0, selection.1, selection.2);
+        v.window_rounding = egui::Rounding::same(10.0);
+        v
+    }
+    fn accent(self) -> egui::Color32 {
+        match self {
+            Theme::Dark | Theme::Blurple => egui::Color32::from_rgb(88,101,242),
+            Theme::Light => egui::Color32::from_rgb(88,101,242),
+            Theme::Midnight => egui::Color32::from_rgb(99,102,241),
+            Theme::Forest => egui::Color32::from_rgb(76,175,80),
+            Theme::Sunset => egui::Color32::from_rgb(255,107,74),
+            Theme::Cyberpunk => egui::Color32::from_rgb(0,255,255),
+            Theme::Mono => egui::Color32::from_rgb(200,200,200),
+        }
+    }
+}
+
+// === Notificaciones ===
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+enum NotifyLevel { None, Mentions, All }
+impl Default for NotifyLevel { fn default() -> Self { NotifyLevel::Mentions } }
+
 // === Ajustes persistentes ===
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct Settings { url: String, dark: bool, zoom: f32, timestamps: bool, compact: bool }
+struct Settings {
+    url: String,
+    theme: Theme,
+    zoom: f32,
+    timestamps: bool,
+    compact: bool,
+    notify: NotifyLevel,
+    font_size: f32,
+    show_member_count: bool,
+    show_emoji_panel: bool,
+    primary_color_hex: String,
+    bubble_radius: f32,
+    message_spacing: f32,
+}
 impl Default for Settings {
     fn default() -> Self {
-        Self { url: "ws://localhost:3000/ws".into(), dark: true, zoom: 1.0, timestamps: true, compact: false }
+        Self {
+            url: "ws://localhost:3000/ws".into(),
+            theme: Theme::Blurple,
+            zoom: 1.0,
+            timestamps: true,
+            compact: false,
+            notify: NotifyLevel::Mentions,
+            font_size: 14.0,
+            show_member_count: true,
+            show_emoji_panel: false,
+            primary_color_hex: "#5865F2".into(),
+            bubble_radius: 8.0,
+            message_spacing: 10.0,
+        }
     }
 }
 impl Settings {
@@ -80,7 +162,7 @@ impl Settings {
     }
 }
 
-// === Helpers ===
+/// === Helpers ===
 fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
 }
@@ -96,30 +178,23 @@ fn role_badge(r: i64) -> &'static str {
 }
 fn role_color(r: i64) -> egui::Color32 {
     match r {
-        3 => egui::Color32::from_rgb(250, 166, 26),
-        2 => egui::Color32::from_rgb(88, 101, 242),
-        1 => egui::Color32::from_rgb(87, 242, 135),
-        _ => egui::Color32::from_rgb(219, 222, 225),
+        3 => egui::Color32::from_rgb(250,166,26),
+        2 => egui::Color32::from_rgb(88,101,242),
+        1 => egui::Color32::from_rgb(87,242,135),
+        _ => egui::Color32::from_rgb(219,222,225),
     }
 }
 fn avatar_color(id: i64) -> egui::Color32 {
-    const P: [(u8, u8, u8); 6] = [(88,101,242),(87,242,135),(250,166,26),(237,66,69),(155,89,182),(26,188,156)];
+    const P: [(u8,u8,u8); 6] = [(88,101,242),(87,242,135),(250,166,26),(237,66,69),(155,89,182),(26,188,156)];
     let c = P[(id.unsigned_abs() as usize) % P.len()];
     egui::Color32::from_rgb(c.0, c.1, c.2)
 }
-fn dark_visuals() -> egui::Visuals {
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = egui::Color32::from_rgb(30, 31, 34);
-    v.window_fill = egui::Color32::from_rgb(43, 45, 49);
-    v.extreme_bg_color = egui::Color32::from_rgb(27, 28, 31);
-    v.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(43, 45, 49);
-    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(54, 57, 63);
-    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(79, 84, 92);
-    v.widgets.active.bg_fill = egui::Color32::from_rgb(88, 101, 242);
-    v.selection.bg_fill = egui::Color32::from_rgb(88, 101, 242);
-    v.window_rounding = egui::Rounding::same(10.0);
-    v
-}
+
+// Emojis comunes para picker rápido
+const EMOJI_PICK: &[&str] = &[
+    "😀","😂","😍","🥰","😎","🤔","😢","😡","👍","👎","❤️","🔥","🎉","✨","💯","🙏",
+    "👀","💪","🤝","🚀","⭐","🌟","💡","🎵","🎮","⚡","☕","🍕","🌈","🦄","🐱","🐶",
+];
 
 struct FigDihApp {
     authed: bool, my_id: i64,
@@ -130,26 +205,42 @@ struct FigDihApp {
     input_text: String,
     new_server_name: String, new_server_icon: String,
     new_channel_name: String, unban_name: String,
-    show_create_server: bool, show_settings: bool, status: String,
+    show_create_server: bool, show_settings: bool, show_emoji: bool, status: String,
     settings: Settings,
     stop: Arc<AtomicBool>,
     ws_tx: Option<mpsc::UnboundedSender<String>>,
     ws_rx: Option<mpsc::UnboundedReceiver<String>>,
     _rt: Arc<Runtime>,
+    notify_tx: std::sync::mpsc::Sender<String>,
 }
 
 impl FigDihApp {
     fn new() -> Self {
         let settings = Settings::load();
+        let (notify_tx, notify_rx) = std::sync::mpsc::channel::<String>();
+
+        // Hilo dedicado a notificaciones (para no bloquear la GUI)
+        std::thread::spawn(move || {
+            while let Ok(msg) = notify_rx.recv() {
+                let _ = notify_rust::Notification::new()
+                    .summary("FigDih")
+                    .body(&msg)
+                    .timeout(notify_rust::Timeout::Milliseconds(4000))
+                    .show();
+            }
+        });
+
         let mut app = Self {
             authed: false, my_id: 0, username: String::new(), password: String::new(),
             auth_error: String::new(), servers: vec![], channels: vec![], messages: vec![],
             members: vec![], selected_server: None, selected_channel: None, my_role: 0,
             input_text: String::new(), new_server_name: String::new(), new_server_icon: String::new(),
             new_channel_name: String::new(), unban_name: String::new(),
-            show_create_server: false, show_settings: false, status: String::new(),
-            settings, stop: Arc::new(AtomicBool::new(false)),
+            show_create_server: false, show_settings: false, show_emoji: false,
+            status: String::new(), settings,
+            stop: Arc::new(AtomicBool::new(false)),
             ws_tx: None, ws_rx: None, _rt: Arc::new(Runtime::new().unwrap()),
+            notify_tx,
         };
         let url = app.settings.url.clone();
         app.connect(url);
@@ -229,39 +320,135 @@ impl FigDihApp {
         self.send_command(ClientMsg::GetMessages { channel_id: id, limit: 50 });
     }
 
-    fn settings_window(&mut self, ctx: &egui::Context) {
+        fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.show_settings { return; }
         let mut do_connect: Option<String> = None;
         let mut do_logout = false;
         let mut close = false;
         egui::Window::new("⚙️ Configuración")
-            .collapsible(false).resizable(false).default_width(380.0)
+            .collapsible(false).resizable(true)
+            .default_size([420.0, 600.0]).min_width(360.0)
             .show(ctx, |ui| {
-                ui.heading("🔌 Conexión");
-                ui.label("URL del servidor WebSocket:");
-                ui.add(egui::TextEdit::singleline(&mut self.settings.url).desired_width(340.0));
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Reconectar").clicked() { do_connect = Some(self.settings.url.clone()); }
-                    if ui.button("Usar localhost").clicked() {
-                        self.settings.url = "ws://localhost:3000/ws".into();
-                        self.settings.save();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+
+                    // === CONEXIÓN ===
+                    ui.heading("🔌 Conexión");
+                    ui.label("URL del servidor:");
+                    ui.add(egui::TextEdit::singleline(&mut self.settings.url).desired_width(380.0));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Reconectar").clicked() { do_connect = Some(self.settings.url.clone()); }
+                        if ui.button("Usar localhost").clicked() {
+                            self.settings.url = "ws://localhost:3000/ws".into();
+                            self.settings.save();
+                        }
+                    });
+
+                    ui.add_space(10.0); ui.separator();
+
+                    // === TEMA ===
+                    ui.heading("🎨 Tema");
+                    egui::Grid::new("theme_grid").num_columns(4).show(ui, |ui| {
+                        for (i, (t, name)) in Theme::all().iter().enumerate() {
+                            let sel = self.settings.theme == *t;
+                            let mut btn = egui::Button::new(*name).min_size(egui::vec2(90.0, 28.0));
+                            if sel { btn = btn.fill(t.accent()).stroke(egui::Stroke::new(2.0_f32, egui::Color32::WHITE)); }
+                            if ui.add(btn).clicked() {
+                                self.settings.theme = *t;
+                                self.settings.save();
+                            }
+                            if (i + 1) % 4 == 0 { ui.end_row(); }
+                        }
+                    });
+
+                    // === TIPOGRAFÍA ===
+                    ui.add_space(10.0); ui.separator();
+                    ui.heading("📝 Tipografía");
+                    ui.horizontal(|ui| {
+                        ui.label("Tamaño:");
+                        let mut fs = self.settings.font_size;
+                        if ui.add(egui::Slider::new(&mut fs, 10.0..=24.0).text("px")).changed() {
+                            self.settings.font_size = fs; self.settings.save();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Zoom UI:");
+                        let mut z = self.settings.zoom;
+                        if ui.add(egui::Slider::new(&mut z, 0.7..=1.8).text("x")).changed() {
+                            self.settings.zoom = z; self.settings.save();
+                        }
+                    });
+
+                    // === DISEÑO ===
+                    ui.add_space(10.0); ui.separator();
+                    ui.heading("🖼️ Diseño");
+                    let mut ts = self.settings.timestamps;
+                    if ui.checkbox(&mut ts, "Mostrar horas en mensajes").changed() {
+                        self.settings.timestamps = ts; self.settings.save();
                     }
-                });
-                ui.add_space(8.0); ui.separator();
-                ui.heading("🎨 Apariencia");
-                let mut dark = self.settings.dark;
-                if ui.checkbox(&mut dark, "Tema oscuro").changed() { self.settings.dark = dark; self.settings.save(); }
-                let mut ts = self.settings.timestamps;
-                if ui.checkbox(&mut ts, "Mostrar horas en mensajes").changed() { self.settings.timestamps = ts; self.settings.save(); }
-                let mut cp = self.settings.compact;
-                if ui.checkbox(&mut cp, "Modo compacto").changed() { self.settings.compact = cp; self.settings.save(); }
-                let mut z = self.settings.zoom;
-                if ui.add(egui::Slider::new(&mut z, 0.8..=1.6).text("Zoom")).changed() { self.settings.zoom = z; self.settings.save(); }
-                ui.add_space(8.0); ui.separator();
-                ui.horizontal(|ui| {
-                    if self.authed && ui.button("🚪 Cerrar sesión").clicked() { do_logout = true; }
-                    if ui.button("Cerrar").clicked() { close = true; }
+                    let mut cp = self.settings.compact;
+                    if ui.checkbox(&mut cp, "Modo compacto").changed() {
+                        self.settings.compact = cp; self.settings.save();
+                    }
+                    let mut mc = self.settings.show_member_count;
+                    if ui.checkbox(&mut mc, "Mostrar contador de miembros").changed() {
+                        self.settings.show_member_count = mc; self.settings.save();
+                    }
+                    let mut ep = self.settings.show_emoji_panel;
+                    if ui.checkbox(&mut ep, "Mostrar botón de emojis").changed() {
+                        self.settings.show_emoji_panel = ep; self.settings.save();
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Radio de burbujas:");
+                        let mut r = self.settings.bubble_radius;
+                        if ui.add(egui::Slider::new(&mut r, 0.0..=20.0).text("px")).changed() {
+                            self.settings.bubble_radius = r; self.settings.save();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Espaciado mensajes:");
+                        let mut s = self.settings.message_spacing;
+                        if ui.add(egui::Slider::new(&mut s, 2.0..=30.0).text("px")).changed() {
+                            self.settings.message_spacing = s; self.settings.save();
+                        }
+                    });
+
+                    // === NOTIFICACIONES ===
+                    ui.add_space(10.0); ui.separator();
+                    ui.heading("🔔 Notificaciones");
+                    ui.horizontal(|ui| {
+                        ui.label("Nivel:");
+                        let current = self.settings.notify;
+                        if ui.selectable_label(current == NotifyLevel::None, "Ninguna").clicked() {
+                            self.settings.notify = NotifyLevel::None; self.settings.save();
+                        }
+                        if ui.selectable_label(current == NotifyLevel::Mentions, "Solo menciones").clicked() {
+                            self.settings.notify = NotifyLevel::Mentions; self.settings.save();
+                        }
+                        if ui.selectable_label(current == NotifyLevel::All, "Todos los mensajes").clicked() {
+                            self.settings.notify = NotifyLevel::All; self.settings.save();
+                        }
+                    });
+                    if ui.button("Probar notificación").clicked() {
+                        let _ = notify_rust::Notification::new()
+                            .summary("FigDih")
+                            .body("¡Las notificaciones funcionan! 🎉")
+                            .show();
+                    }
+
+                    // === ACCIONES ===
+                    ui.add_space(10.0); ui.separator();
+                    ui.horizontal(|ui| {
+                        if self.authed && ui.button("🚪 Cerrar sesión").clicked() { do_logout = true; }
+                        if ui.button("Restablecer ajustes").clicked() {
+                            self.settings = Settings::default();
+                            self.settings.save();
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Cerrar").clicked() { close = true; }
+                        });
+                    });
                 });
             });
         if let Some(u) = do_connect { self.settings.save(); self.connect(u); self.show_settings = false; }
@@ -272,7 +459,7 @@ impl FigDihApp {
 
 impl eframe::App for FigDihApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.set_visuals(if self.settings.dark { dark_visuals() } else { egui::Visuals::light() });
+        ctx.set_visuals(self.settings.theme.visuals());
         ctx.set_zoom_factor(self.settings.zoom);
 
         // === Drenar y procesar mensajes ===
@@ -299,7 +486,17 @@ impl eframe::App for FigDihApp {
                         if self.selected_channel == Some(channel_id) { self.messages = messages; }
                     }
                     ServerMsg::Message(m) => {
-                        if self.selected_channel == Some(m.channel_id) { self.messages.push(m); }
+                        if self.selected_channel == Some(m.channel_id) { self.messages.push(m.clone()); }
+                        // Notificación si aplica
+                        let should_notify = match self.settings.notify {
+                            NotifyLevel::None => false,
+                            NotifyLevel::All => true,
+                            NotifyLevel::Mentions => m.text.contains(&self.username),
+                        };
+                        if should_notify && m.user_id != self.my_id && self.selected_channel != Some(m.channel_id) {
+                            let ch_name = self.channels.iter().find(|c| c.id == m.channel_id).map(|c| c.name.as_str()).unwrap_or("?");
+                            let _ = self.notify_tx.send(format!("💬 #{} — {}: {}", ch_name, m.username, m.text.chars().take(80).collect::<String>()));
+                        }
                     }
                     ServerMsg::MessageDeleted { channel_id, message_id } => {
                         if self.selected_channel == Some(channel_id) { self.messages.retain(|m| m.id != message_id); }
@@ -516,12 +713,15 @@ impl eframe::App for FigDihApp {
         });
 
         // === Input ===
-        egui::TopBottomPanel::bottom("input").show(ctx, |ui| {
+                egui::TopBottomPanel::bottom("input").show(ctx, |ui| {
             ui.add_space(4.0);
             if self.selected_channel.is_some() {
                 ui.horizontal(|ui| {
+                    if self.settings.show_emoji_panel && ui.button("😀").clicked() {
+                        self.show_emoji = !self.show_emoji;
+                    }
                     let te = ui.add(egui::TextEdit::singleline(&mut self.input_text)
-                        .hint_text("Escribe un mensaje...").desired_width(ui.available_width() - 90.0));
+                        .hint_text("Escribe un mensaje...").desired_width(ui.available_width() - 90.0 - if self.settings.show_emoji_panel { 40.0 } else { 0.0 }));
                     let enter = te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.add_sized([80.0, 28.0], egui::Button::new("Enviar 🚀")).clicked() || enter {
                         if !self.input_text.trim().is_empty() {
@@ -530,6 +730,23 @@ impl eframe::App for FigDihApp {
                         }
                     }
                 });
+                // Panel de emojis rápido
+                if self.show_emoji {
+                    ui.add_space(4.0);
+                    egui::Frame::none()
+                        .fill(ctx.style().visuals.window_fill)
+                        .rounding(egui::Rounding::same(6.0))
+                        .inner_margin(egui::Margin::same(4.0))
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                for &em in EMOJI_PICK {
+                                    if ui.add(egui::Button::new(em).frame(false)).clicked() {
+                                        self.input_text.push_str(em);
+                                    }
+                                }
+                            });
+                        });
+                }
             } else {
                 ui.label("Selecciona un canal para chatear");
             }
