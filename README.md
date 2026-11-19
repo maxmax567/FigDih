@@ -1,6 +1,6 @@
 <div align="center">
 
-![FigDih](client/assets/icon.png)
+![FigDih](client/assets/FigDih.png)
 
 # 💬 FigDih
 
