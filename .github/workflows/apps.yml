@@ -1,0 +1,142 @@
+name: App Release (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versión de la app (ej: 0.5.1). Vacío = fecha.'
+        required: false
+        default: ''
+      url:
+        description: 'URL por defecto del servidor (wss://.../ws)'
+        required: true
+        default: 'wss://biz-scenes-assumed-history.trycloudflare.com/ws'
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      url: ${{ steps.v.outputs.url }}
+    steps:
+      - id: v
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then V="${{ inputs.version }}"; else V="$(date +%Y.%m.%d-%H%M)"; fi
+          echo "version=$V" >> $GITHUB_OUTPUT
+          echo "url=${{ inputs.url }}" >> $GITHUB_OUTPUT
+          echo "Compilando con URL: ${{ inputs.url }}"
+
+  windows:
+    needs: meta
+    runs-on: windows-latest
+    env:
+      FIGDIH_DEFAULT_URL: ${{ needs.meta.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+      - name: Build
+        working-directory: client
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-windows
+          path: client/target/release/figdih-client.exe
+
+  linux:
+    needs: meta
+    runs-on: ubuntu-22.04
+    env:
+      FIGDIH_DEFAULT_URL: ${{ needs.meta.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+
+      - name: Dependencias GUI + audio
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libx11-dev libx11-xcb-dev libgl1-mesa-dev libegl1-mesa-dev libgles2-mesa-dev \
+            libasound2-dev libdbus-1-dev
+
+      - name: Build
+        working-directory: client
+        run: cargo build --release
+
+      - name: AppImage
+        run: |
+          mkdir -p AppDir/usr/bin
+          cp client/target/release/figdih-client AppDir/usr/bin/
+          cat > AppDir/AppRun << 'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/figdih-client" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+          cat > AppDir/figdih.desktop << 'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=FigDih
+          Comment=Chat ultraligero en Rust
+          Exec=figdih-client
+          Icon=figdih
+          Categories=Network;InstantMessaging;
+          EOF
+          if [ -f client/assets/FigDih.png ]; then
+            cp client/assets/FigDih.png AppDir/figdih.png
+          else
+            convert -size 256x256 gradient:'#5865F2'-'#3b44b8' -fill white -stroke none \
+              -draw "roundrectangle 48,56 208,168 28,28" -draw "polygon 88,160 88,204 132,168" AppDir/figdih.png
+          fi
+          cp AppDir/figdih.png AppDir/.DirIcon
+          wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          ./appimagetool-x86_64.AppImage --appimage-extract >/dev/null
+          ./squashfs-root/AppRun AppDir FigDih-x86_64.AppImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-linux
+          path: FigDih-x86_64.AppImage
+
+  publish:
+    needs: [meta, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+      - name: Aplanar
+        run: |
+          mkdir -p rel
+          find dl -type f -exec cp {} rel/ \;
+          ls -lh rel/
+      - name: Notas
+        run: |
+          cat > NOTES.md << 'EOF'
+          ## 💬 FigDih App ${{ needs.meta.outputs.version }}
+
+          **Servidor por defecto:** `${{ needs.meta.outputs.url }}`
+
+          | Plataforma | Archivo |
+          |---|---|
+          | Linux | `FigDih-x86_64.AppImage` (`chmod +x` y doble clic) |
+          | Windows | `figdih-client.exe` |
+
+          ¿Venías de otra versión? Pulsa ⚙ → 🔌 Conexión → **↺ URL de esta build**.
+          EOF
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: app-v${{ needs.meta.outputs.version }}
+          name: "💬 App ${{ needs.meta.outputs.version }}"
+          body_path: NOTES.md
+          files: rel/*
