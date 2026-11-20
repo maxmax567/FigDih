@@ -85,9 +85,17 @@ jobs:
     needs: [meta, docker, binaries]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Descargar servidor Linux
+        uses: actions/download-artifact@v4
         with:
-          path: dl
+          name: server-Linux
+          path: dl/linux
+
+      - name: Descargar servidor Windows
+        uses: actions/download-artifact@v4
+        with:
+          name: server-Windows
+          path: dl/windows
 
       - name: Aplanar archivos
         run: |
@@ -103,14 +111,14 @@ jobs:
           ### Docker (recomendado)
           ```bash
           docker pull ghcr.io/${{ github.repository_owner }}/figdih:${{ needs.meta.outputs.version }}
-          docker compose pull && docker compose up -d
           ```
+          En CasaOS: `docker compose pull && docker compose up -d`
 
           ### Binarios
           - `figdih-server-linux-x86_64.tar.gz`
           - `figdih-server-windows-x86_64.zip`
 
-          ⚠️ Tras actualizar el servidor, copia la nueva URL del túnel y lanza **App Release** con ella.
+          ⚠️ Tras actualizar, copia la nueva URL del túnel y lanza **App Release** con ella.
           EOF
 
       - uses: softprops/action-gh-release@v2

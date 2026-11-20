@@ -112,9 +112,17 @@ jobs:
     needs: [meta, windows, linux]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Descargar cliente Windows
+        uses: actions/download-artifact@v4
         with:
-          path: dl
+          name: app-windows
+          path: dl/windows
+
+      - name: Descargar AppImage Linux
+        uses: actions/download-artifact@v4
+        with:
+          name: app-linux
+          path: dl/linux
       - name: Aplanar
         run: |
           mkdir -p rel
