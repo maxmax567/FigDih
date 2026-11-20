@@ -1,32 +1,45 @@
 use argon2::password_hash::{rand_core::OsRng, SaltString};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use axum::{
-    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, State},
-    response::Response,
-    routing::get,
-    Router,
-};
-use dashmap::DashMap;
+use axum::extract::ws::{Message as WsMsg, WebSocket, WebSocketUpgrade};
+use axum::extract::State;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::Router;
 use futures_util::{SinkExt, StreamExt};
-use rusqlite::OptionalExtension;
+use rand::Rng;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio_rusqlite::{params, Connection};
+use tokio::sync::{mpsc, Mutex};
+use tokio_rusqlite::Connection;
 
-// === Tipos compartidos ===
+// ===================== Protocolo =====================
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct ServerInfo { id: i64, name: String, icon: String, my_role: i64 }
-
+struct ServerInfo {
+    id: i64, name: String, icon: String,
+    description: String, banner: String, color: String,
+    owner_id: i64, my_role: i64, members: i64,
+}
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ChannelInfo { id: i64, server_id: i64, name: String }
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct ChatMessage { id: i64, user_id: i64, username: String, channel_id: i64, text: String, timestamp: i64 }
-
+struct ChatMessage {
+    id: i64, user_id: i64, username: String, display_name: String,
+    channel_id: i64, text: String, timestamp: i64,
+}
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct MemberInfo { user_id: i64, username: String, role: i64, online: bool, muted_until: i64 }
+struct MemberInfo {
+    user_id: i64, username: String, display_name: String,
+    avatar_emoji: String, avatar_color: String, status: i64,
+    role: i64, online: bool, muted_until: i64,
+}
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ProfileInfo {
+    user_id: i64, username: String, display_name: String,
+    avatar_emoji: String, avatar_color: String, status: i64, bio: String,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 enum ClientMsg {
@@ -34,6 +47,11 @@ enum ClientMsg {
     Login { username: String, password: String },
     GetServers,
     CreateServer { name: String, icon: String },
+    UpdateServer { server_id: i64, name: String, icon: String, description: String, banner: String, color: String },
+    GetInvite { server_id: i64 },
+    RegenInvite { server_id: i64 },
+    JoinByInvite { code: String },
+    LeaveServer { server_id: i64 },
     GetChannels { server_id: i64 },
     CreateChannel { server_id: i64, name: String },
     Join { channel_id: i64 },
@@ -47,6 +65,8 @@ enum ClientMsg {
     Kick { server_id: i64, username: String },
     Ban { server_id: i64, username: String },
     Unban { server_id: i64, username: String },
+    UpdateProfile { display_name: String, avatar_emoji: String, avatar_color: String, status: i64, bio: String },
+    GetProfile { user_id: i64 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,495 +85,782 @@ enum ServerMsg {
     Kicked { server_id: i64 },
     Banned { server_id: i64 },
     TimedOut { until: i64 },
+    Invite { server_id: i64, code: String },
+    Profile(ProfileInfo),
+    ServerLeft { server_id: i64 },
 }
 
-// === Estado ===
-struct Conn {
-    tx: mpsc::UnboundedSender<Message>,
-    user_id: i64, // 0 = sin autenticar
-    username: String,
-    channel: Option<i64>,
-}
+// ===================== Estado =====================
+type Tx = mpsc::UnboundedSender<String>;
+
+struct Conn { tx: Tx, uid: i64, username: String, channel: Option<i64>, viewing: Option<i64> }
 
 struct AppState {
     db: Connection,
-    conns: DashMap<usize, Conn>,
+    conns: Mutex<HashMap<u64, Conn>>,
+    next: AtomicU64,
 }
-
-static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
 fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
 }
-
-fn send_to(tx: &mpsc::UnboundedSender<Message>, msg: &ServerMsg) {
-    let _ = tx.send(Message::Text(serde_json::to_string(msg).unwrap()));
+fn gen_code() -> String {
+    rand::thread_rng().sample_iter(rand::distributions::Alphanumeric)
+        .take(8).map(char::from).collect::<String>().to_lowercase()
+}
+fn clean(s: &str, max: usize) -> String {
+    s.trim().chars().take(max).collect::<String>()
 }
 
-fn broadcast_channel(state: &AppState, channel_id: i64, msg: &ServerMsg) {
-    let text = serde_json::to_string(msg).unwrap();
-    for c in state.conns.iter() {
-        if c.channel == Some(channel_id) {
-            let _ = c.tx.send(Message::Text(text.clone()));
-        }
-    }
+fn push(tx: &Tx, m: &ServerMsg) {
+    if let Ok(j) = serde_json::to_string(m) { let _ = tx.send(j); }
+}
+async fn reply(st: &AppState, cid: u64, m: &ServerMsg) {
+    let c = st.conns.lock().await;
+    if let Some(c) = c.get(&cid) { push(&c.tx, m); }
+}
+async fn err(st: &AppState, cid: u64, t: &str) {
+    reply(st, cid, &ServerMsg::Error { text: t.to_string() }).await;
+}
+async fn note(st: &AppState, cid: u64, t: &str) {
+    reply(st, cid, &ServerMsg::Notice { text: t.to_string() }).await;
+}
+async fn to_channel(st: &AppState, channel: i64, m: &ServerMsg) {
+    let c = st.conns.lock().await;
+    for x in c.values() { if x.channel == Some(channel) { push(&x.tx, m); } }
+}
+async fn to_server(st: &AppState, sid: i64, m: &ServerMsg) {
+    let c = st.conns.lock().await;
+    for x in c.values() { if x.viewing == Some(sid) { push(&x.tx, m); } }
+}
+async fn to_user(st: &AppState, uid: i64, m: &ServerMsg) {
+    let c = st.conns.lock().await;
+    for x in c.values() { if x.uid == uid { push(&x.tx, m); } }
+}
+async fn online_ids(st: &AppState) -> Vec<i64> {
+    let c = st.conns.lock().await;
+    let mut v: Vec<i64> = c.values().filter(|x| x.uid != 0).map(|x| x.uid).collect();
+    v.sort_unstable(); v.dedup(); v
 }
 
-async fn server_channels(state: &AppState, server_id: i64) -> Vec<i64> {
-    state.db.call(move |conn| {
-        let mut stmt = conn.prepare("SELECT id FROM channels WHERE server_id = ?")?;
-        let rows = stmt.query_map(params![server_id], |r| r.get::<_, i64>(0))?
-            .filter_map(|r| r.ok()).collect();
-        Ok(rows)
-    }).await.unwrap_or_default()
+// ===================== Consultas =====================
+async fn role_of(st: &AppState, sid: i64, uid: i64) -> i64 {
+    st.db.call(move |c| {
+        let owner: i64 = c.query_row("SELECT owner_id FROM servers WHERE id=?", params![sid],
+            |r| r.get::<_, i64>(0)).unwrap_or(0);
+        if owner != 0 && owner == uid { return Ok(3i64); }
+        let role: Option<i64> = c.query_row(
+            "SELECT role FROM members WHERE server_id=? AND user_id=?", params![sid, uid],
+            |r| r.get::<_, i64>(0)).optional()?;
+        Ok(role.unwrap_or(-1i64))
+    }).await.unwrap_or(-1)
 }
 
-async fn broadcast_server(state: &AppState, server_id: i64, msg: &ServerMsg) {
-    let chs = server_channels(state, server_id).await;
-    let text = serde_json::to_string(msg).unwrap();
-    for c in state.conns.iter() {
-        if let Some(ch) = c.channel {
-            if chs.contains(&ch) {
-                let _ = c.tx.send(Message::Text(text.clone()));
-            }
-        }
-    }
-}
-
-async fn role_of(state: &AppState, server_id: i64, user_id: i64) -> i64 {
-    state.db.call(move |conn| {
-        let owner: i64 = conn.query_row("SELECT owner_id FROM servers WHERE id = ?", params![server_id], |r| r.get(0))?;
-        if owner == user_id { return Ok(3); }
-        let role: Option<i64> = conn.query_row(
-            "SELECT role FROM members WHERE server_id = ? AND user_id = ?",
-            params![server_id, user_id], |r| r.get(0)).optional()?;
-        Ok(role.unwrap_or(0))
-    }).await.unwrap_or(0)
-}
-
-async fn user_id_by_name(state: &AppState, username: &str) -> Option<i64> {
-    let name = username.to_string();
-    state.db.call(move |conn| {
-        let id: Option<i64> = conn.query_row(
-            "SELECT id FROM users WHERE username = ?", params![name],
+async fn uid_by_name(st: &AppState, name: &str) -> Option<i64> {
+    let n = name.to_string();
+    st.db.call(move |c| {
+        let id: Option<i64> = c.query_row("SELECT id FROM users WHERE username=?", params![n],
             |r| r.get::<_, i64>(0)).optional()?;
         Ok(id)
     }).await.ok().flatten()
 }
 
-async fn channel_server(state: &AppState, channel_id: i64) -> Option<i64> {
-    state.db.call(move |conn| {
-        let sid: Option<i64> = conn.query_row(
-            "SELECT server_id FROM channels WHERE id = ?", params![channel_id],
+async fn channel_server(st: &AppState, ch: i64) -> Option<i64> {
+    st.db.call(move |c| {
+        let sid: Option<i64> = c.query_row("SELECT server_id FROM channels WHERE id=?", params![ch],
             |r| r.get::<_, i64>(0)).optional()?;
         Ok(sid)
     }).await.ok().flatten()
 }
 
-async fn mod_check(state: &AppState, server_id: i64, actor: i64, target: &str, min_role: i64) -> Result<i64, String> {
-    let actor_role = role_of(state, server_id, actor).await;
-    if actor_role < min_role { return Err("No tienes permisos para eso".into()); }
-    let tid = user_id_by_name(state, target).await.ok_or("Ese usuario no existe")?;
-    if tid == actor { return Err("No puedes moderarte a ti mismo".into()); }
-    if role_of(state, server_id, tid).await >= actor_role {
-        return Err("No puedes moderar a alguien de igual o mayor rango".into());
-    }
-    Ok(tid)
+async fn is_banned(st: &AppState, sid: i64, uid: i64) -> bool {
+    st.db.call(move |c| {
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM bans WHERE server_id=? AND user_id=?",
+            params![sid, uid], |r| r.get::<_, i64>(0))?;
+        Ok(n > 0)
+    }).await.unwrap_or(false)
 }
 
-async fn send_servers(state: &AppState, tx: &mpsc::UnboundedSender<Message>, uid: i64) {
-    let servers: Vec<ServerInfo> = state.db.call(move |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT s.id, s.name, s.icon, s.owner_id, COALESCE(m.role, 0)
-             FROM servers s LEFT JOIN members m ON m.server_id = s.id AND m.user_id = ?
-             ORDER BY s.id")?;
-        let rows = stmt.query_map(params![uid], |r| {
-            let owner: i64 = r.get(3)?;
-            let mut role: i64 = r.get(4)?;
-            if owner == uid { role = 3; }
-            Ok(ServerInfo { id: r.get(0)?, name: r.get(1)?, icon: r.get(2)?, my_role: role })
-        })?.filter_map(|r| r.ok()).collect();
-        Ok(rows)
+async fn send_servers(st: &AppState, cid: u64, uid: i64) {
+    let rows: Vec<ServerInfo> = st.db.call(move |c| {
+        let mut s = c.prepare(
+            "SELECT s.id, s.name, s.icon, s.description, s.banner, s.color, s.owner_id, m.role, \
+             (SELECT COUNT(*) FROM members mm WHERE mm.server_id = s.id) \
+             FROM servers s JOIN members m ON m.server_id = s.id \
+             WHERE m.user_id = ? ORDER BY s.id")?;
+        let it = s.query_map(params![uid], |r| Ok(ServerInfo {
+            id: r.get::<_, i64>(0)?,
+            name: r.get::<_, String>(1)?,
+            icon: r.get::<_, String>(2)?,
+            description: r.get::<_, String>(3)?,
+            banner: r.get::<_, String>(4)?,
+            color: r.get::<_, String>(5)?,
+            owner_id: r.get::<_, i64>(6)?,
+            my_role: r.get::<_, i64>(7)?,
+            members: r.get::<_, i64>(8)?,
+        }))?;
+        let v = it.collect::<Result<Vec<_>, _>>()?;
+        Ok(v)
     }).await.unwrap_or_default();
-    send_to(tx, &ServerMsg::Servers(servers));
+    reply(st, cid, &ServerMsg::Servers(rows)).await;
 }
 
-async fn push_channels(state: &AppState, server_id: i64) {
-    let channels: Vec<ChannelInfo> = state.db.call(move |conn| {
-        let mut stmt = conn.prepare("SELECT id, server_id, name FROM channels WHERE server_id = ? ORDER BY id")?;
-        let rows = stmt.query_map(params![server_id], |r| {
-            Ok(ChannelInfo { id: r.get(0)?, server_id: r.get(1)?, name: r.get(2)? })
-        })?.filter_map(|r| r.ok()).collect();
-        Ok(rows)
+async fn send_channels(st: &AppState, sid: i64) {
+    let rows: Vec<ChannelInfo> = st.db.call(move |c| {
+        let mut s = c.prepare("SELECT id, server_id, name FROM channels WHERE server_id=? ORDER BY id")?;
+        let it = s.query_map(params![sid], |r| Ok(ChannelInfo {
+            id: r.get::<_, i64>(0)?, server_id: r.get::<_, i64>(1)?, name: r.get::<_, String>(2)?,
+        }))?;
+        let v = it.collect::<Result<Vec<_>, _>>()?;
+        Ok(v)
     }).await.unwrap_or_default();
-    broadcast_server(state, server_id, &ServerMsg::Channels { server_id, channels }).await;
+    to_server(st, sid, &ServerMsg::Channels { server_id: sid, channels: rows }).await;
 }
 
-async fn push_members(state: &AppState, server_id: i64) {
-    let mut members: Vec<MemberInfo> = state.db.call(move |conn| {
-        let owner: i64 = conn.query_row("SELECT owner_id FROM servers WHERE id = ?", params![server_id], |r| r.get(0))?;
-        let mut stmt = conn.prepare(
-            "SELECT u.id, u.username, m.role, m.muted_until
-             FROM members m JOIN users u ON u.id = m.user_id WHERE m.server_id = ? ORDER BY m.role DESC, u.username")?;
-        let rows = stmt.query_map(params![server_id], |r| {
-            let uid: i64 = r.get(0)?;
-            let mut role: i64 = r.get(2)?;
-            if uid == owner { role = 3; }
-            Ok(MemberInfo { user_id: uid, username: r.get(1)?, role, online: false, muted_until: r.get(3)? })
-        })?.filter_map(|r| r.ok()).collect();
-        Ok(rows)
+async fn send_members(st: &AppState, sid: i64) {
+    let on = online_ids(st).await;
+    let rows: Vec<MemberInfo> = st.db.call(move |c| {
+        let mut s = c.prepare(
+            "SELECT u.id, u.username, u.display_name, u.avatar_emoji, u.avatar_color, u.status, m.role, m.muted_until \
+             FROM members m JOIN users u ON u.id = m.user_id WHERE m.server_id=? \
+             ORDER BY m.role DESC, u.username COLLATE NOCASE")?;
+        let it = s.query_map(params![sid], |r| Ok(MemberInfo {
+            user_id: r.get::<_, i64>(0)?,
+            username: r.get::<_, String>(1)?,
+            display_name: r.get::<_, String>(2)?,
+            avatar_emoji: r.get::<_, String>(3)?,
+            avatar_color: r.get::<_, String>(4)?,
+            status: r.get::<_, i64>(5)?,
+            role: r.get::<_, i64>(6)?,
+            online: false,
+            muted_until: r.get::<_, i64>(7)?,
+        }))?;
+        let v = it.collect::<Result<Vec<_>, _>>()?;
+        Ok(v)
     }).await.unwrap_or_default();
-    for m in &mut members {
-        m.online = state.conns.iter().any(|c| c.user_id == m.user_id);
-    }
-    broadcast_server(state, server_id, &ServerMsg::Members { server_id, members }).await;
+    let rows: Vec<MemberInfo> = rows.into_iter().map(|mut m| {
+        m.online = on.contains(&m.user_id); m
+    }).collect();
+    to_server(st, sid, &ServerMsg::Members { server_id: sid, members: rows }).await;
 }
 
-async fn kick_or_ban(st: &AppState, tx: &mpsc::UnboundedSender<Message>, server_id: i64, uid: i64, username: &str, is_ban: bool) {
-    let min_role = if is_ban { 2 } else { 1 };
-    match mod_check(st, server_id, uid, username, min_role).await {
-        Ok(tid) => {
-            let _: Result<(), _> = st.db.call(move |conn| {
-                if is_ban {
-                    conn.execute("INSERT OR IGNORE INTO bans (server_id, user_id) VALUES (?, ?)", params![server_id, tid])?;
-                }
-                conn.execute("DELETE FROM members WHERE server_id = ? AND user_id = ?", params![server_id, tid])?;
-                Ok(())
-            }).await;
-            let chs = server_channels(st, server_id).await;
-            for mut c in st.conns.iter_mut() {
-                if c.user_id == tid {
-                    if let Some(canal) = c.channel {
-                        if chs.contains(&canal) {
-                            c.channel = None;
-                            let m = if is_ban { ServerMsg::Banned { server_id } } else { ServerMsg::Kicked { server_id } };
-                            send_to(&c.tx, &m);
-                        }
-                    }
-                }
+async fn profile_of(st: &AppState, uid: i64) -> Option<ProfileInfo> {
+    st.db.call(move |c| {
+        let p = c.query_row(
+            "SELECT id, username, display_name, avatar_emoji, avatar_color, status, bio FROM users WHERE id=?",
+            params![uid], |r| Ok(ProfileInfo {
+                user_id: r.get::<_, i64>(0)?,
+                username: r.get::<_, String>(1)?,
+                display_name: r.get::<_, String>(2)?,
+                avatar_emoji: r.get::<_, String>(3)?,
+                avatar_color: r.get::<_, String>(4)?,
+                status: r.get::<_, i64>(5)?,
+                bio: r.get::<_, String>(6)?,
+            })).optional()?;
+        Ok(p)
+    }).await.ok().flatten()
+}
+
+// ===================== Moderación =====================
+async fn kick_or_ban(st: &AppState, cid: u64, sid: i64, actor: i64, target: &str, ban: bool) {
+    let need = if ban { 2 } else { 1 };
+    let my = role_of(st, sid, actor).await;
+    if my < need { err(st, cid, "No tienes permisos para eso").await; return; }
+    let tuid = match uid_by_name(st, target).await {
+        Some(u) => u,
+        None => { err(st, cid, "Ese usuario no existe").await; return; }
+    };
+    if tuid == actor { err(st, cid, "No puedes hacer eso contigo mismo").await; return; }
+    let tr = role_of(st, sid, tuid).await;
+    if tr < 0 { err(st, cid, "Ese usuario no está en el servidor").await; return; }
+    if tr >= my { err(st, cid, "No puedes actuar sobre alguien de igual o mayor rango").await; return; }
+
+    let t = target.to_string();
+    let _ = st.db.call(move |c| {
+        if ban { c.execute("INSERT OR IGNORE INTO bans(server_id,user_id) VALUES(?,?)", params![sid, tuid])?; }
+        c.execute("DELETE FROM members WHERE server_id=? AND user_id=?", params![sid, tuid])?;
+        Ok(())
+    }).await;
+
+    // saca al afectado de cualquier canal de ese servidor
+    let chs: Vec<i64> = st.db.call(move |c| {
+        let mut s = c.prepare("SELECT id FROM channels WHERE server_id=?")?;
+        let it = s.query_map(params![sid], |r| r.get::<_, i64>(0))?;
+        let v = it.collect::<Result<Vec<_>, _>>()?;
+        Ok(v)
+    }).await.unwrap_or_default();
+    {
+        let mut cs = st.conns.lock().await;
+        for x in cs.values_mut() {
+            if x.uid == tuid {
+                if let Some(ch) = x.channel { if chs.contains(&ch) { x.channel = None; } }
+                if x.viewing == Some(sid) { x.viewing = None; }
             }
-            push_members(st, server_id).await;
-            send_to(tx, &ServerMsg::Notice { text: format!("{} {}", if is_ban { "🚫 Baneado" } else { "👢 Expulsado" }, username) });
         }
-        Err(e) => send_to(tx, &ServerMsg::Error { text: e }),
     }
+    let msg = if ban { ServerMsg::Banned { server_id: sid } } else { ServerMsg::Kicked { server_id: sid } };
+    to_user(st, tuid, &msg).await;
+    send_servers(st, cid, actor).await;
+    for ch in chs {
+        let t2 = if ban { format!("🚫 {} fue baneado", t) } else { format!("👢 {} fue expulsado", t) };
+        to_channel(st, ch, &ServerMsg::System { channel_id: ch, text: t2 }).await;
+    }
+    send_members(st, sid).await;
+    note(st, cid, if ban { "🚫 Usuario baneado" } else { "👢 Usuario expulsado" }).await;
 }
 
-async fn init_db() -> Connection {
-    let db = Connection::open("figdih-v3.db").await.unwrap();
-    db.call(|conn| {
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
-             CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS servers (id INTEGER PRIMARY KEY, name TEXT NOT NULL, icon TEXT, owner_id INTEGER DEFAULT 0);
-             CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY, server_id INTEGER NOT NULL, name TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, user_id INTEGER, username TEXT, channel_id INTEGER, text TEXT, timestamp INTEGER, deleted INTEGER DEFAULT 0);
-             CREATE TABLE IF NOT EXISTS members (server_id INTEGER, user_id INTEGER, role INTEGER DEFAULT 0, muted_until INTEGER DEFAULT 0, PRIMARY KEY (server_id, user_id));
-             CREATE TABLE IF NOT EXISTS bans (server_id INTEGER, user_id INTEGER, PRIMARY KEY (server_id, user_id));
-             CREATE INDEX IF NOT EXISTS idx_msg_channel ON messages(channel_id, deleted);"
-        )?;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM servers", [], |r| r.get(0))?;
-        if count == 0 {
-            conn.execute("INSERT INTO servers (name, icon, owner_id) VALUES ('General', '🌍', 0)", [])?;
-            conn.execute("INSERT INTO channels (server_id, name) VALUES (1, 'general')", [])?;
-            conn.execute("INSERT INTO channels (server_id, name) VALUES (1, 'random')", [])?;
+// ===================== Init / migraciones =====================
+async fn init_db(db: &Connection) {
+    db.call(|c| {
+        c.execute_batch("
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS users(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS servers(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                icon TEXT NOT NULL DEFAULT '🌍');
+            CREATE TABLE IF NOT EXISTS channels(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                name TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                timestamp INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS members(
+                server_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                role INTEGER NOT NULL DEFAULT 0,
+                muted_until INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(server_id,user_id));
+            CREATE TABLE IF NOT EXISTS bans(
+                server_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                PRIMARY KEY(server_id,user_id));
+            CREATE INDEX IF NOT EXISTS idx_msg_ch ON messages(channel_id, id);
+        ")?;
+        // Migraciones tolerantes (ignoran error si la columna ya existe)
+        for sql in [
+            "ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN avatar_emoji TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN avatar_color TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN status INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN bio TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE servers ADD COLUMN description TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE servers ADD COLUMN banner TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE servers ADD COLUMN color TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE servers ADD COLUMN invite_code TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE servers ADD COLUMN owner_id INTEGER NOT NULL DEFAULT 0",
+        ] { let _ = c.execute(sql, []); }
+        Ok(())
+    }).await.expect("init db");
+
+    // Servidor General por defecto
+    db.call(|c| {
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM servers", [], |r| r.get::<_, i64>(0))?;
+        if n == 0 {
+            c.execute("INSERT INTO servers(name,icon,description) VALUES('General','🌍','Servidor público de bienvenida')", [])?;
+            let sid = c.last_insert_rowid();
+            c.execute("INSERT INTO channels(server_id,name) VALUES(?,'general')", params![sid])?;
+            c.execute("INSERT INTO channels(server_id,name) VALUES(?,'random')", params![sid])?;
         }
         Ok(())
-    }).await.unwrap();
-    db
+    }).await.expect("seed");
+
+    // Códigos de invitación que falten
+    let missing: Vec<i64> = db.call(|c| {
+        let mut s = c.prepare("SELECT id FROM servers WHERE invite_code=''")?;
+        let it = s.query_map([], |r| r.get::<_, i64>(0))?;
+        let v = it.collect::<Result<Vec<_>, _>>()?;
+        Ok(v)
+    }).await.unwrap_or_default();
+    for sid in missing {
+        let code = gen_code();
+        let _ = db.call(move |c| {
+            c.execute("UPDATE servers SET invite_code=? WHERE id=?", params![code, sid])?;
+            Ok(())
+        }).await;
+    }
+}
+
+// ===================== Comandos =====================
+async fn handle_cmd(st: &Arc<AppState>, cid: u64, cmd: ClientMsg) {
+    let (uid, uname, channel, _viewing) = {
+        let cs = st.conns.lock().await;
+        match cs.get(&cid) {
+            Some(x) => (x.uid, x.username.clone(), x.channel, x.viewing),
+            None => return,
+        }
+    };
+
+    match cmd {
+        ClientMsg::Register { username, password } => {
+            let u = clean(&username, 24);
+            if u.len() < 3 { err(st, cid, "Usuario mínimo 3 caracteres").await; return; }
+            if password.len() < 4 { err(st, cid, "Contraseña mínimo 4 caracteres").await; return; }
+            if !u.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                err(st, cid, "Usuario: solo letras, números, _ y -").await; return;
+            }
+            let salt = SaltString::generate(&mut OsRng);
+            let hash = match Argon2::default().hash_password(password.as_bytes(), &salt) {
+                Ok(h) => h.to_string(),
+                Err(_) => { err(st, cid, "Error interno de hash").await; return; }
+            };
+            let u2 = u.clone();
+            let res: Result<i64, String> = st.db.call(move |c| {
+                let n: i64 = c.query_row("SELECT COUNT(*) FROM users WHERE username=?", params![u2],
+                    |r| r.get::<_, i64>(0))?;
+                if n > 0 { return Ok(Err("Ese usuario ya existe".to_string())); }
+                c.execute("INSERT INTO users(username,password_hash) VALUES(?,?)", params![u2, hash])?;
+                let id = c.last_insert_rowid();
+                let total: i64 = c.query_row("SELECT COUNT(*) FROM users", [], |r| r.get::<_, i64>(0))?;
+                let first: i64 = c.query_row("SELECT id FROM servers ORDER BY id LIMIT 1", [],
+                    |r| r.get::<_, i64>(0)).unwrap_or(0);
+                if first != 0 {
+                    let role = if total == 1 { 3 } else { 0 };
+                    c.execute("INSERT OR IGNORE INTO members(server_id,user_id,role) VALUES(?,?,?)",
+                        params![first, id, role])?;
+                    if total == 1 { c.execute("UPDATE servers SET owner_id=? WHERE id=?", params![id, first])?; }
+                }
+                Ok(Ok(id))
+            }).await.map_err(|e| e.to_string()).and_then(|x| x);
+
+            match res {
+                Ok(id) => {
+                    { let mut cs = st.conns.lock().await;
+                      if let Some(x) = cs.get_mut(&cid) { x.uid = id; x.username = u.clone(); } }
+                    reply(st, cid, &ServerMsg::AuthOk { user_id: id, username: u.clone() }).await;
+                    note(st, cid, "✨ Cuenta creada. ¡Bienvenido!").await;
+                    if let Some(p) = profile_of(st, id).await { reply(st, cid, &ServerMsg::Profile(p)).await; }
+                }
+                Err(e) => reply(st, cid, &ServerMsg::AuthErr { reason: e }).await,
+            }
+        }
+
+        ClientMsg::Login { username, password } => {
+            let u = clean(&username, 24);
+            let u2 = u.clone();
+            let row: Option<(i64, String)> = st.db.call(move |c| {
+                let r: Option<(i64, String)> = c.query_row(
+                    "SELECT id, password_hash FROM users WHERE username=?", params![u2],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).optional()?;
+                Ok(r)
+            }).await.ok().flatten();
+
+            let Some((id, hash)) = row else {
+                reply(st, cid, &ServerMsg::AuthErr { reason: "Usuario o contraseña incorrectos".into() }).await;
+                return;
+            };
+            let ok = PasswordHash::new(&hash).ok()
+                .map(|h| Argon2::default().verify_password(password.as_bytes(), &h).is_ok())
+                .unwrap_or(false);
+            if !ok {
+                reply(st, cid, &ServerMsg::AuthErr { reason: "Usuario o contraseña incorrectos".into() }).await;
+                return;
+            }
+            // garantiza acceso al servidor de bienvenida
+            let _ = st.db.call(move |c| {
+                let first: i64 = c.query_row("SELECT id FROM servers ORDER BY id LIMIT 1", [],
+                    |r| r.get::<_, i64>(0)).unwrap_or(0);
+                if first != 0 {
+                    c.execute("INSERT OR IGNORE INTO members(server_id,user_id,role) VALUES(?,?,0)",
+                        params![first, id])?;
+                }
+                Ok(())
+            }).await;
+            { let mut cs = st.conns.lock().await;
+              if let Some(x) = cs.get_mut(&cid) { x.uid = id; x.username = u.clone(); } }
+            reply(st, cid, &ServerMsg::AuthOk { user_id: id, username: u.clone() }).await;
+            if let Some(p) = profile_of(st, id).await { reply(st, cid, &ServerMsg::Profile(p)).await; }
+        }
+
+        ClientMsg::GetServers => {
+            if uid == 0 { err(st, cid, "No has iniciado sesión").await; return; }
+            send_servers(st, cid, uid).await;
+        }
+
+        ClientMsg::CreateServer { name, icon } => {
+            if uid == 0 { err(st, cid, "No has iniciado sesión").await; return; }
+            let n = clean(&name, 40);
+            if n.is_empty() { err(st, cid, "Ponle un nombre al servidor").await; return; }
+            let ic = if clean(&icon, 8).is_empty() { "🌍".to_string() } else { clean(&icon, 8) };
+            let code = gen_code();
+            let sid: i64 = st.db.call(move |c| {
+                c.execute("INSERT INTO servers(name,icon,invite_code,owner_id) VALUES(?,?,?,?)",
+                    params![n, ic, code, uid])?;
+                let sid = c.last_insert_rowid();
+                c.execute("INSERT INTO channels(server_id,name) VALUES(?,'general')", params![sid])?;
+                c.execute("INSERT INTO members(server_id,user_id,role) VALUES(?,?,3)", params![sid, uid])?;
+                Ok(sid)
+            }).await.unwrap_or(0);
+            if sid == 0 { err(st, cid, "No se pudo crear").await; return; }
+            { let mut cs = st.conns.lock().await;
+              if let Some(x) = cs.get_mut(&cid) { x.viewing = Some(sid); } }
+            send_servers(st, cid, uid).await;
+            send_channels(st, sid).await;
+            send_members(st, sid).await;
+            note(st, cid, "🎉 Servidor creado. Eres el 👑 owner").await;
+        }
+
+        ClientMsg::UpdateServer { server_id, name, icon, description, banner, color } => {
+            if role_of(st, server_id, uid).await < 2 { err(st, cid, "Solo admin u owner pueden editar el servidor").await; return; }
+            let n = clean(&name, 40);
+            if n.is_empty() { err(st, cid, "El nombre no puede estar vacío").await; return; }
+            let ic = clean(&icon, 8);
+            let de = clean(&description, 200);
+            let ba = clean(&banner, 200);
+            let co = clean(&color, 9);
+            let _ = st.db.call(move |c| {
+                c.execute("UPDATE servers SET name=?, icon=?, description=?, banner=?, color=? WHERE id=?",
+                    params![n, ic, de, ba, co, server_id])?;
+                Ok(())
+            }).await;
+            let members: Vec<i64> = st.db.call(move |c| {
+                let mut s = c.prepare("SELECT user_id FROM members WHERE server_id=?")?;
+                let it = s.query_map(params![server_id], |r| r.get::<_, i64>(0))?;
+                let v = it.collect::<Result<Vec<_>, _>>()?;
+                Ok(v)
+            }).await.unwrap_or_default();
+            for m in members { refresh_user_servers(st, m).await; }
+            send_channels(st, server_id).await;
+            note(st, cid, "✅ Servidor actualizado").await;
+        }
+
+        ClientMsg::GetInvite { server_id } => {
+            if role_of(st, server_id, uid).await < 2 { err(st, cid, "Solo admin u owner ven el código").await; return; }
+            let code: String = st.db.call(move |c| {
+                let s: String = c.query_row("SELECT invite_code FROM servers WHERE id=?", params![server_id],
+                    |r| r.get::<_, String>(0)).unwrap_or_default();
+                Ok(s)
+            }).await.unwrap_or_default();
+            reply(st, cid, &ServerMsg::Invite { server_id, code }).await;
+        }
+
+        ClientMsg::RegenInvite { server_id } => {
+            if role_of(st, server_id, uid).await < 3 { err(st, cid, "Solo el owner puede regenerar el código").await; return; }
+            let code = gen_code();
+            let c2 = code.clone();
+            let _ = st.db.call(move |c| {
+                c.execute("UPDATE servers SET invite_code=? WHERE id=?", params![c2, server_id])?;
+                Ok(())
+            }).await;
+            reply(st, cid, &ServerMsg::Invite { server_id, code }).await;
+            note(st, cid, "🔄 Código regenerado (el anterior ya no sirve)").await;
+        }
+
+        ClientMsg::JoinByInvite { code } => {
+            if uid == 0 { err(st, cid, "No has iniciado sesión").await; return; }
+            let code = clean(&code, 32).to_lowercase();
+            let sid: Option<i64> = st.db.call(move |c| {
+                let s: Option<i64> = c.query_row("SELECT id FROM servers WHERE invite_code=?", params![code],
+                    |r| r.get::<_, i64>(0)).optional()?;
+                Ok(s)
+            }).await.ok().flatten();
+            let Some(sid) = sid else { err(st, cid, "Código de invitación no válido").await; return; };
+            if is_banned(st, sid, uid).await { err(st, cid, "Estás baneado de ese servidor").await; return; }
+            if role_of(st, sid, uid).await >= 0 { note(st, cid, "Ya estás en ese servidor").await; send_servers(st, cid, uid).await; return; }
+            let _ = st.db.call(move |c| {
+                c.execute("INSERT OR IGNORE INTO members(server_id,user_id,role) VALUES(?,?,0)", params![sid, uid])?;
+                Ok(())
+            }).await;
+            { let mut cs = st.conns.lock().await;
+              if let Some(x) = cs.get_mut(&cid) { x.viewing = Some(sid); } }
+            send_servers(st, cid, uid).await;
+            send_channels(st, sid).await;
+            send_members(st, sid).await;
+            note(st, cid, "🎉 Te has unido al servidor").await;
+        }
+
+        ClientMsg::LeaveServer { server_id } => {
+            let r = role_of(st, server_id, uid).await;
+            if r < 0 { err(st, cid, "No estás en ese servidor").await; return; }
+            if r == 3 { err(st, cid, "El owner no puede salir: transfiere o borra el servidor").await; return; }
+            let _ = st.db.call(move |c| {
+                c.execute("DELETE FROM members WHERE server_id=? AND user_id=?", params![server_id, uid])?;
+                Ok(())
+            }).await;
+            { let mut cs = st.conns.lock().await;
+              if let Some(x) = cs.get_mut(&cid) { if x.viewing == Some(server_id) { x.viewing = None; } } }
+            reply(st, cid, &ServerMsg::ServerLeft { server_id }).await;
+            send_servers(st, cid, uid).await;
+            send_members(st, server_id).await;
+        }
+
+        ClientMsg::GetChannels { server_id } => {
+            if role_of(st, server_id, uid).await < 0 { err(st, cid, "No estás en ese servidor").await; return; }
+            { let mut cs = st.conns.lock().await;
+              if let Some(x) = cs.get_mut(&cid) { x.viewing = Some(server_id); } }
+            send_channels(st, server_id).await;
+        }
+
+        ClientMsg::CreateChannel { server_id, name } => {
+            if role_of(st, server_id, uid).await < 2 { err(st, cid, "Solo admin u owner crean canales").await; return; }
+            let n = clean(&name, 32).to_lowercase().replace(' ', "-");
+            if n.is_empty() { err(st, cid, "Nombre de canal vacío").await; return; }
+            let _ = st.db.call(move |c| {
+                c.execute("INSERT INTO channels(server_id,name) VALUES(?,?)", params![server_id, n])?;
+                Ok(())
+            }).await;
+            send_channels(st, server_id).await;
+            note(st, cid, "✅ Canal creado").await;
+        }
+
+        ClientMsg::Join { channel_id } => {
+            let Some(sid) = channel_server(st, channel_id).await else { err(st, cid, "Canal inexistente").await; return; };
+            if role_of(st, sid, uid).await < 0 { err(st, cid, "No estás en ese servidor").await; return; }
+            if is_banned(st, sid, uid).await { err(st, cid, "Estás baneado").await; return; }
+            { let mut cs = st.conns.lock().await;
+              if let Some(x) = cs.get_mut(&cid) { x.channel = Some(channel_id); x.viewing = Some(sid); } }
+            note(st, cid, "💬 Canal abierto").await;
+        }
+
+        ClientMsg::Leave => {
+            let mut cs = st.conns.lock().await;
+            if let Some(x) = cs.get_mut(&cid) { x.channel = None; }
+        }
+
+        ClientMsg::Send { text } => {
+            let Some(ch) = channel else { err(st, cid, "Abre un canal primero").await; return; };
+            let Some(sid) = channel_server(st, ch).await else { return; };
+            if role_of(st, sid, uid).await < 0 { err(st, cid, "No estás en ese servidor").await; return; }
+            if is_banned(st, sid, uid).await { err(st, cid, "Estás baneado").await; return; }
+            let t = clean(&text, 2000);
+            if t.is_empty() { return; }
+            let muted: i64 = st.db.call(move |c| {
+                let m: Option<i64> = c.query_row("SELECT muted_until FROM members WHERE server_id=? AND user_id=?",
+                    params![sid, uid], |r| r.get::<_, i64>(0)).optional()?;
+                Ok(m.unwrap_or(0))
+            }).await.unwrap_or(0);
+            if muted > now() {
+                reply(st, cid, &ServerMsg::TimedOut { until: muted }).await;
+                err(st, cid, "Estás silenciado").await; return;
+            }
+            let ts = now();
+            let id: i64 = st.db.call(move |c| {
+                c.execute("INSERT INTO messages(channel_id,user_id,text,timestamp) VALUES(?,?,?,?)",
+                    params![ch, uid, t, ts])?;
+                Ok(c.last_insert_rowid())
+            }).await.unwrap_or(0);
+            if id == 0 { err(st, cid, "No se pudo guardar").await; return; }
+            let dn = profile_of(st, uid).await.map(|p| if p.display_name.is_empty() { p.username.clone() } else { p.display_name }).unwrap_or_else(|| uname.clone());
+            let m = ChatMessage { id, user_id: uid, username: uname.clone(), display_name: dn, channel_id: ch, text: clean(&text, 2000), timestamp: ts };
+            to_channel(st, ch, &ServerMsg::Message(m)).await;
+        }
+
+        ClientMsg::GetMessages { channel_id, limit } => {
+            let Some(sid) = channel_server(st, channel_id).await else { return; };
+            if role_of(st, sid, uid).await < 0 { err(st, cid, "No estás en ese servidor").await; return; }
+            let lim = limit.clamp(1, 1000);
+            let rows: Vec<ChatMessage> = st.db.call(move |c| {
+                let mut s = c.prepare(
+                    "SELECT m.id, m.user_id, u.username, u.display_name, m.channel_id, m.text, m.timestamp \
+                     FROM messages m JOIN users u ON u.id=m.user_id \
+                     WHERE m.channel_id=? ORDER BY m.id DESC LIMIT ?")?;
+                let it = s.query_map(params![channel_id, lim], |r| Ok(ChatMessage {
+                    id: r.get::<_, i64>(0)?,
+                    user_id: r.get::<_, i64>(1)?,
+                    username: r.get::<_, String>(2)?,
+                    display_name: r.get::<_, String>(3)?,
+                    channel_id: r.get::<_, i64>(4)?,
+                    text: r.get::<_, String>(5)?,
+                    timestamp: r.get::<_, i64>(6)?,
+                }))?;
+                let v = it.collect::<Result<Vec<_>, _>>()?;
+                Ok(v)
+            }).await.unwrap_or_default();
+            let rows: Vec<ChatMessage> = rows.into_iter().rev().collect();
+            reply(st, cid, &ServerMsg::Messages { channel_id, messages: rows }).await;
+        }
+
+        ClientMsg::GetMembers { server_id } => {
+            if role_of(st, server_id, uid).await < 0 { err(st, cid, "No estás en ese servidor").await; return; }
+            { let mut cs = st.conns.lock().await;
+              if let Some(x) = cs.get_mut(&cid) { x.viewing = Some(server_id); } }
+            send_members(st, server_id).await;
+        }
+
+        ClientMsg::DeleteMessage { message_id } => {
+            let info: Option<(i64, i64, i64)> = st.db.call(move |c| {
+                let r: Option<(i64, i64, i64)> = c.query_row(
+                    "SELECT m.channel_id, m.user_id, c.server_id FROM messages m \
+                     JOIN channels c ON c.id=m.channel_id WHERE m.id=?", params![message_id],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))).optional()?;
+                Ok(r)
+            }).await.ok().flatten();
+            let Some((ch, author, sid)) = info else { return; };
+            let my = role_of(st, sid, uid).await;
+            if author != uid && my < 1 { err(st, cid, "No puedes borrar ese mensaje").await; return; }
+            let _ = st.db.call(move |c| {
+                c.execute("DELETE FROM messages WHERE id=?", params![message_id])?;
+                Ok(())
+            }).await;
+            to_channel(st, ch, &ServerMsg::MessageDeleted { channel_id: ch, message_id }).await;
+        }
+
+        ClientMsg::SetRole { server_id, username, role } => {
+            let my = role_of(st, server_id, uid).await;
+            if my < 2 { err(st, cid, "Solo admin u owner cambian roles").await; return; }
+            let r = role.clamp(0, 2);
+            if r == 2 && my < 3 { err(st, cid, "Solo el owner nombra admins").await; return; }
+            let Some(t) = uid_by_name(st, &username).await else { err(st, cid, "Usuario inexistente").await; return; };
+            if t == uid { err(st, cid, "No puedes cambiarte el rol a ti mismo").await; return; }
+            if role_of(st, server_id, t).await >= my { err(st, cid, "Rango insuficiente").await; return; }
+            let _ = st.db.call(move |c| {
+                c.execute("UPDATE members SET role=? WHERE server_id=? AND user_id=?", params![r, server_id, t])?;
+                Ok(())
+            }).await;
+            send_members(st, server_id).await;
+            refresh_user_servers(st, t).await;
+            note(st, cid, "✅ Rol actualizado").await;
+        }
+
+        ClientMsg::Timeout { server_id, username, minutes } => {
+            let my = role_of(st, server_id, uid).await;
+            if my < 1 { err(st, cid, "Solo mod o superior silencian").await; return; }
+            let Some(t) = uid_by_name(st, &username).await else { err(st, cid, "Usuario inexistente").await; return; };
+            if t == uid || role_of(st, server_id, t).await >= my { err(st, cid, "Rango insuficiente").await; return; }
+            let mins = minutes.clamp(1, 1440);
+            let until = now() + mins * 60;
+            let _ = st.db.call(move |c| {
+                c.execute("UPDATE members SET muted_until=? WHERE server_id=? AND user_id=?", params![until, server_id, t])?;
+                Ok(())
+            }).await;
+            to_user(st, t, &ServerMsg::TimedOut { until }).await;
+            send_members(st, server_id).await;
+            note(st, cid, "🔇 Usuario silenciado").await;
+        }
+
+        ClientMsg::Kick { server_id, username } => kick_or_ban(st, cid, server_id, uid, &username, false).await,
+        ClientMsg::Ban { server_id, username } => kick_or_ban(st, cid, server_id, uid, &username, true).await,
+
+        ClientMsg::Unban { server_id, username } => {
+            if role_of(st, server_id, uid).await < 2 { err(st, cid, "Solo admin u owner desbanean").await; return; }
+            let Some(t) = uid_by_name(st, &username).await else { err(st, cid, "Usuario inexistente").await; return; };
+            let _ = st.db.call(move |c| {
+                c.execute("DELETE FROM bans WHERE server_id=? AND user_id=?", params![server_id, t])?;
+                Ok(())
+            }).await;
+            note(st, cid, "✅ Usuario desbaneado (debe volver con el código)").await;
+        }
+
+        ClientMsg::UpdateProfile { display_name, avatar_emoji, avatar_color, status, bio } => {
+            if uid == 0 { err(st, cid, "No has iniciado sesión").await; return; }
+            let dn = clean(&display_name, 32);
+            let ae = clean(&avatar_emoji, 8);
+            let ac = clean(&avatar_color, 9);
+            let stt = status.clamp(0, 3);
+            let b = clean(&bio, 200);
+            let _ = st.db.call(move |c| {
+                c.execute("UPDATE users SET display_name=?, avatar_emoji=?, avatar_color=?, status=?, bio=? WHERE id=?",
+                    params![dn, ae, ac, stt, b, uid])?;
+                Ok(())
+            }).await;
+            if let Some(p) = profile_of(st, uid).await { reply(st, cid, &ServerMsg::Profile(p)).await; }
+            let sids: Vec<i64> = st.db.call(move |c| {
+                let mut s = c.prepare("SELECT server_id FROM members WHERE user_id=?")?;
+                let it = s.query_map(params![uid], |r| r.get::<_, i64>(0))?;
+                let v = it.collect::<Result<Vec<_>, _>>()?;
+                Ok(v)
+            }).await.unwrap_or_default();
+            for s in sids { send_members(st, s).await; }
+            note(st, cid, "✅ Perfil actualizado").await;
+        }
+
+        ClientMsg::GetProfile { user_id } => {
+            if uid == 0 { return; }
+            match profile_of(st, user_id).await {
+                Some(p) => reply(st, cid, &ServerMsg::Profile(p)).await,
+                None => err(st, cid, "Perfil no encontrado").await,
+            }
+        }
+    }
+}
+
+async fn refresh_user_servers(st: &Arc<AppState>, target: i64) {
+    let txs: Vec<Tx> = {
+        let cs = st.conns.lock().await;
+        cs.values().filter(|x| x.uid == target).map(|x| x.tx.clone()).collect()
+    };
+    if txs.is_empty() { return; }
+    let rows: Vec<ServerInfo> = st.db.call(move |c| {
+        let mut s = c.prepare(
+            "SELECT s.id, s.name, s.icon, s.description, s.banner, s.color, s.owner_id, m.role, \
+             (SELECT COUNT(*) FROM members mm WHERE mm.server_id = s.id) \
+             FROM servers s JOIN members m ON m.server_id=s.id WHERE m.user_id=? ORDER BY s.id")?;
+        let it = s.query_map(params![target], |r| Ok(ServerInfo {
+            id: r.get::<_, i64>(0)?, name: r.get::<_, String>(1)?, icon: r.get::<_, String>(2)?,
+            description: r.get::<_, String>(3)?, banner: r.get::<_, String>(4)?, color: r.get::<_, String>(5)?,
+            owner_id: r.get::<_, i64>(6)?, my_role: r.get::<_, i64>(7)?, members: r.get::<_, i64>(8)?,
+        }))?;
+        let v = it.collect::<Result<Vec<_>, _>>()?;
+        Ok(v)
+    }).await.unwrap_or_default();
+    let m = ServerMsg::Servers(rows);
+    for tx in txs { push(&tx, &m); }
+}
+
+// ===================== WebSocket =====================
+async fn ws_handler(ws: WebSocketUpgrade, State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    ws.on_upgrade(move |sock| handle_socket(sock, st))
+}
+
+async fn handle_socket(sock: WebSocket, st: Arc<AppState>) {
+    let (mut sink, mut stream) = sock.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let cid = st.next.fetch_add(1, Ordering::Relaxed);
+    st.conns.lock().await.insert(cid, Conn {
+        tx: tx.clone(), uid: 0, username: String::new(), channel: None, viewing: None,
+    });
+
+    let writer = tokio::spawn(async move {
+        while let Some(m) = rx.recv().await {
+            if sink.send(WsMsg::Text(m)).await.is_err() { break; }
+        }
+    });
+
+    while let Some(Ok(msg)) = stream.next().await {
+        match msg {
+            WsMsg::Text(t) => {
+                if let Ok(cmd) = serde_json::from_str::<ClientMsg>(&t) {
+                    handle_cmd(&st, cid, cmd).await;
+                }
+            }
+            WsMsg::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    let (uid, viewing) = {
+        let mut cs = st.conns.lock().await;
+        let v = cs.get(&cid).map(|x| (x.uid, x.viewing)).unwrap_or((0, None));
+        cs.remove(&cid);
+        v
+    };
+    writer.abort();
+    if uid != 0 {
+        if let Some(s) = viewing { send_members(&st, s).await; }
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    let state = Arc::new(AppState { db: init_db().await, conns: DashMap::new() });
+    let db = Connection::open("figdih-v3.db").await.expect("no se pudo abrir la BD");
+    init_db(&db).await;
+    let st = Arc::new(AppState { db, conns: Mutex::new(HashMap::new()), next: AtomicU64::new(1) });
+
     let app = Router::new()
+        .route("/health", get(|| async { "FigDih v0.6 OK 🚀" }))
         .route("/ws", get(ws_handler))
-        .route("/health", get(|| async { "FigDih v3.0 OK 🚀" }))
-        .with_state(state);
-    println!("🚀 FigDih v3.0 en http://0.0.0.0:3000 — auth + roles + moderación");
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
-}
+        .with_state(st);
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
-}
-
-async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
-    let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-    let conn_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    state.conns.insert(conn_id, Conn { tx: tx.clone(), user_id: 0, username: String::new(), channel: None });
-
-    let send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if sender.send(msg).await.is_err() { break; }
-        }
-    });
-
-    let st = state.clone();
-    let recv_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = receiver.next().await {
-            let Message::Text(text) = msg else { continue };
-            let Ok(cmd) = serde_json::from_str::<ClientMsg>(&text) else { continue };
-
-            // Snapshot de la conexión (nunca mantener refs de DashMap across .await)
-            let (uid, uname, ch) = {
-                let c = st.conns.get(&conn_id).unwrap();
-                (c.user_id, c.username.clone(), c.channel)
-            };
-
-            match cmd {
-                ClientMsg::Register { username, password } => {
-                    if username.len() < 3 || username.len() > 20 || username.contains(' ') {
-                        send_to(&tx, &ServerMsg::AuthErr { reason: "Usuario: 3-20 caracteres, sin espacios".into() });
-                        continue;
-                    }
-                    if password.len() < 4 {
-                        send_to(&tx, &ServerMsg::AuthErr { reason: "Contraseña: mínimo 4 caracteres".into() });
-                        continue;
-                    }
-                    let salt = SaltString::generate(&mut OsRng);
-                    let hash = match Argon2::default().hash_password(password.as_bytes(), &salt) {
-                        Ok(h) => h.to_string(),
-                        Err(_) => { send_to(&tx, &ServerMsg::AuthErr { reason: "Error interno".into() }); continue; }
-                    };
-                    let uname2 = username.clone();
-                    let res: Result<i64, _> = st.db.call(move |conn| {
-                        conn.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", params![uname2, hash])?;
-                        let id = conn.last_insert_rowid();
-                        let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
-                        if count == 1 {
-                            conn.execute("UPDATE servers SET owner_id = ? WHERE name = 'General'", params![id])?;
-                            conn.execute("INSERT OR IGNORE INTO members (server_id, user_id, role) VALUES (1, ?, 3)", params![id])?;
-                        }
-                        Ok(id)
-                    }).await;
-                    match res {
-                        Ok(id) => {
-                            if let Some(mut c) = st.conns.get_mut(&conn_id) { c.user_id = id; c.username = username.clone(); }
-                            send_to(&tx, &ServerMsg::AuthOk { user_id: id, username });
-                            send_servers(&st, &tx, id).await;
-                        }
-                        Err(_) => send_to(&tx, &ServerMsg::AuthErr { reason: "Ese nombre ya está registrado".into() }),
-                    }
-                }
-                ClientMsg::Login { username, password } => {
-                    let uname2 = username.clone();
-                    let row: Option<(i64, String)> = st.db.call(move |conn| {
-                        let r: Option<(i64, String)> = conn.query_row(
-                            "SELECT id, password_hash FROM users WHERE username = ?", params![uname2],
-                            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).optional()?;
-                        Ok(r)
-                    }).await.ok().flatten();
-                    let ok = row.as_ref().map(|(_, h)| {
-                        PasswordHash::new(h).map(|p| Argon2::default().verify_password(password.as_bytes(), &p).is_ok()).unwrap_or(false)
-                    }).unwrap_or(false);
-                    if let (true, Some((id, _))) = (ok, row) {
-                        if let Some(mut c) = st.conns.get_mut(&conn_id) { c.user_id = id; c.username = username.clone(); }
-                        send_to(&tx, &ServerMsg::AuthOk { user_id: id, username });
-                        send_servers(&st, &tx, id).await;
-                    } else {
-                        send_to(&tx, &ServerMsg::AuthErr { reason: "Usuario o contraseña incorrectos".into() });
-                    }
-                }
-                _ if uid == 0 => send_to(&tx, &ServerMsg::Error { text: "Inicia sesión primero".into() }),
-                ClientMsg::GetServers => send_servers(&st, &tx, uid).await,
-                ClientMsg::CreateServer { name, icon } => {
-                    if name.trim().is_empty() { send_to(&tx, &ServerMsg::Error { text: "Nombre vacío".into() }); continue; }
-                    let (n, i) = (name.trim().to_string(), if icon.trim().is_empty() { "💬".to_string() } else { icon.trim().to_string() });
-                    let res: Result<i64, _> = st.db.call(move |conn| {
-                        conn.execute("INSERT INTO servers (name, icon, owner_id) VALUES (?, ?, ?)", params![n, i, uid])?;
-                        let sid = conn.last_insert_rowid();
-                        conn.execute("INSERT INTO members (server_id, user_id, role) VALUES (?, ?, 3)", params![sid, uid])?;
-                        conn.execute("INSERT INTO channels (server_id, name) VALUES (?, 'general')", params![sid])?;
-                        Ok(sid)
-                    }).await;
-                    if res.is_ok() {
-                        send_servers(&st, &tx, uid).await;
-                        send_to(&tx, &ServerMsg::Notice { text: "🎉 Servidor creado. Eres el 👑 owner".into() });
-                    }
-                }
-                ClientMsg::GetChannels { server_id } => {
-                    let channels: Vec<ChannelInfo> = st.db.call(move |conn| {
-                        let mut stmt = conn.prepare("SELECT id, server_id, name FROM channels WHERE server_id = ? ORDER BY id")?;
-                        let rows = stmt.query_map(params![server_id], |r| {
-                            Ok(ChannelInfo { id: r.get(0)?, server_id: r.get(1)?, name: r.get(2)? })
-                        })?.filter_map(|r| r.ok()).collect();
-                        Ok(rows)
-                    }).await.unwrap_or_default();
-                    send_to(&tx, &ServerMsg::Channels { server_id, channels });
-                }
-                ClientMsg::CreateChannel { server_id, name } => {
-                    if role_of(&st, server_id, uid).await < 2 {
-                        send_to(&tx, &ServerMsg::Error { text: "Necesitas 🛡️ admin para crear canales".into() });
-                        continue;
-                    }
-                    let n = name.trim().trim_start_matches('#').to_string();
-                    if n.is_empty() { continue; }
-                    let res: Result<(), _> = st.db.call(move |conn| {
-                        conn.execute("INSERT INTO channels (server_id, name) VALUES (?, ?)", params![server_id, n])?;
-                        Ok(())
-                    }).await;
-                    if res.is_ok() { push_channels(&st, server_id).await; }
-                }
-                ClientMsg::Join { channel_id } => {
-                    let sid = match channel_server(&st, channel_id).await {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    let banned: i64 = st.db.call(move |conn| {
-                        let b: i64 = conn.query_row("SELECT COUNT(*) FROM bans WHERE server_id = ? AND user_id = ?", params![sid, uid], |r| r.get(0))?;
-                        if b == 0 {
-                            conn.execute("INSERT OR IGNORE INTO members (server_id, user_id, role, muted_until) VALUES (?, ?, 0, 0)", params![sid, uid])?;
-                        }
-                        Ok(b)
-                    }).await.unwrap_or(1);
-                    if banned > 0 {
-                        send_to(&tx, &ServerMsg::Banned { server_id: sid });
-                        continue;
-                    }
-                    if let Some(mut c) = st.conns.get_mut(&conn_id) { c.channel = Some(channel_id); }
-                    broadcast_channel(&st, channel_id, &ServerMsg::System { channel_id, text: format!("→ {} se unió", uname) });
-                    push_members(&st, sid).await;
-                }
-                ClientMsg::Leave => {
-                    if let Some(old) = ch {
-                        if let Some(mut c) = st.conns.get_mut(&conn_id) { c.channel = None; }
-                        broadcast_channel(&st, old, &ServerMsg::System { channel_id: old, text: format!("← {} salió", uname) });
-                        if let Some(sid) = channel_server(&st, old).await { push_members(&st, sid).await; }
-                    }
-                }
-                ClientMsg::Send { text } => {
-                    let Some(canal) = ch else { send_to(&tx, &ServerMsg::Error { text: "Únete a un canal".into() }); continue };
-                    if text.trim().is_empty() { continue; }
-                    let (t, ts, u2) = (text.trim().to_string(), now(), uname.clone());
-                    let res: Result<Result<i64, String>, _> = st.db.call(move |conn| {
-                        let sid: i64 = conn.query_row("SELECT server_id FROM channels WHERE id = ?", params![canal], |r| r.get(0))?;
-                        let banned: i64 = conn.query_row("SELECT COUNT(*) FROM bans WHERE server_id = ? AND user_id = ?", params![sid, uid], |r| r.get(0))?;
-                        if banned > 0 { return Ok(Err("Estás baneado de este servidor".to_string())); }
-                        let muted: i64 = conn.query_row("SELECT muted_until FROM members WHERE server_id = ? AND user_id = ?", params![sid, uid], |r| r.get(0)).optional()?.unwrap_or(0);
-                        if muted > ts { return Ok(Err(format!("🔇 Silenciado {}s más", muted - ts))); }
-                        conn.execute("INSERT INTO messages (user_id, username, channel_id, text, timestamp) VALUES (?, ?, ?, ?, ?)",
-                            params![uid, u2, canal, t, ts])?;
-                        Ok(Ok(conn.last_insert_rowid()))
-                    }).await;
-                    match res {
-                        Ok(Ok(id)) => broadcast_channel(&st, canal, &ServerMsg::Message(ChatMessage {
-                            id, user_id: uid, username: uname, channel_id: canal, text: text.trim().to_string(), timestamp: now(),
-                        })),
-                        Ok(Err(e)) => send_to(&tx, &ServerMsg::Error { text: e }),
-                        Err(_) => send_to(&tx, &ServerMsg::Error { text: "Error guardando el mensaje".into() }),
-                    }
-                }
-                ClientMsg::GetMessages { channel_id, limit } => {
-                    let mut messages: Vec<ChatMessage> = st.db.call(move |conn| {
-                        let mut stmt = conn.prepare(
-                            "SELECT id, user_id, username, channel_id, text, timestamp FROM messages
-                             WHERE channel_id = ? AND deleted = 0 ORDER BY id DESC LIMIT ?")?;
-                        let rows = stmt.query_map(params![channel_id, limit], |r| {
-                            Ok(ChatMessage { id: r.get(0)?, user_id: r.get(1)?, username: r.get(2)?, channel_id: r.get(3)?, text: r.get(4)?, timestamp: r.get(5)? })
-                        })?.filter_map(|r| r.ok()).collect();
-                        Ok(rows)
-                    }).await.unwrap_or_default();
-                    messages.reverse();
-                    send_to(&tx, &ServerMsg::Messages { channel_id, messages });
-                }
-                ClientMsg::GetMembers { server_id } => push_members(&st, server_id).await,
-                ClientMsg::DeleteMessage { message_id } => {
-                    let info: Option<(i64, i64, i64)> = st.db.call(move |conn| {
-                        let r: Option<(i64, i64, i64)> = conn.query_row(
-                            "SELECT m.channel_id, m.user_id, c.server_id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.id = ?",
-                            params![message_id],
-                            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))).optional()?;
-                        Ok(r)
-                    }).await.ok().flatten();
-                    if let Some((canal, author, sid)) = info {
-                        if author != uid && role_of(&st, sid, uid).await < 1 {
-                            send_to(&tx, &ServerMsg::Error { text: "Solo 🔨 mod+ puede borrar mensajes ajenos".into() });
-                            continue;
-                        }
-                        let _: Result<(), _> = st.db.call(move |conn| {
-                            conn.execute("UPDATE messages SET deleted = 1 WHERE id = ?", params![message_id])?;
-                            Ok(())
-                        }).await;
-                        broadcast_channel(&st, canal, &ServerMsg::MessageDeleted { channel_id: canal, message_id });
-                    }
-                }
-                ClientMsg::SetRole { server_id, username, role } => {
-                    match mod_check(&st, server_id, uid, &username, 2).await {
-                        Ok(tid) => {
-                            let actor_role = role_of(&st, server_id, uid).await;
-                            if !(0..=2).contains(&role) || role >= actor_role {
-                                send_to(&tx, &ServerMsg::Error { text: "Solo puedes asignar roles menores al tuyo".into() });
-                                continue;
-                            }
-                            let _: Result<(), _> = st.db.call(move |conn| {
-                                conn.execute("INSERT OR IGNORE INTO members (server_id, user_id, role, muted_until) VALUES (?, ?, 0, 0)", params![server_id, tid])?;
-                                conn.execute("UPDATE members SET role = ? WHERE server_id = ? AND user_id = ?", params![role, server_id, tid])?;
-                                Ok(())
-                            }).await;
-                            push_members(&st, server_id).await;
-                            send_to(&tx, &ServerMsg::Notice { text: format!("Rol de {} actualizado", username) });
-                        }
-                        Err(e) => send_to(&tx, &ServerMsg::Error { text: e }),
-                    }
-                }
-                ClientMsg::Timeout { server_id, username, minutes } => {
-                    match mod_check(&st, server_id, uid, &username, 1).await {
-                        Ok(tid) => {
-                            let until = now() + minutes.max(1) * 60;
-                            let _: Result<(), _> = st.db.call(move |conn| {
-                                conn.execute("INSERT OR IGNORE INTO members (server_id, user_id, role, muted_until) VALUES (?, ?, 0, 0)", params![server_id, tid])?;
-                                conn.execute("UPDATE members SET muted_until = ? WHERE server_id = ? AND user_id = ?", params![until, server_id, tid])?;
-                                Ok(())
-                            }).await;
-                            for c in st.conns.iter() {
-                                if c.user_id == tid { send_to(&c.tx, &ServerMsg::TimedOut { until }); }
-                            }
-                            push_members(&st, server_id).await;
-                            send_to(&tx, &ServerMsg::Notice { text: format!("🔇 {} silenciado {} min", username, minutes) });
-                        }
-                        Err(e) => send_to(&tx, &ServerMsg::Error { text: e }),
-                    }
-                }
-                ClientMsg::Kick { server_id, username } => {
-                    kick_or_ban(&st, &tx, server_id, uid, &username, false).await;
-                }
-                ClientMsg::Ban { server_id, username } => {
-                    kick_or_ban(&st, &tx, server_id, uid, &username, true).await;
-                }
-                ClientMsg::Unban { server_id, username } => {
-                    if role_of(&st, server_id, uid).await < 2 {
-                        send_to(&tx, &ServerMsg::Error { text: "Necesitas 🛡️ admin".into() });
-                        continue;
-                    }
-                    if let Some(tid) = user_id_by_name(&st, &username).await {
-                        let _: Result<(), _> = st.db.call(move |conn| {
-                            conn.execute("DELETE FROM bans WHERE server_id = ? AND user_id = ?", params![server_id, tid])?;
-                            Ok(())
-                        }).await;
-                        send_to(&tx, &ServerMsg::Notice { text: format!("✅ {} desbaneado", username) });
-                    }
-                }
-            }
-        }
-
-        // Limpieza al desconectar
-        let (uid2, uname2, ch2) = {
-            match st.conns.get(&conn_id) {
-                Some(c) => (c.user_id, c.username.clone(), c.channel),
-                None => (0, String::new(), None),
-            }
-        };
-        st.conns.remove(&conn_id);
-        if let Some(canal) = ch2 {
-            broadcast_channel(&st, canal, &ServerMsg::System { channel_id: canal, text: format!("← {} se desconectó", uname2) });
-            if uid2 != 0 {
-                if let Some(sid) = channel_server(&st, canal).await { push_members(&st, sid).await; }
-            }
-        }
-    });
-
-    let _ = tokio::join!(send_task, recv_task);
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
+    println!("🚀 FigDih v0.6 en http://{} — identidad + invites + perfiles", addr);
+    axum::serve(listener, app).await.expect("serve");
 }
